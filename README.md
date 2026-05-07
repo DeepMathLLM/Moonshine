@@ -2,7 +2,7 @@
 
 **A local agent framework for autonomous mathematical research, exploration, and evolution.**
 
-Not a Q&A tool. It's a command-line workspace where an LLM can sit with a problem—following long proof attempts, searching its own past thoughts, calling specialized tools, and leaving behind a complete, verifiable research trail.
+Not a Q&A tool. It's a command-line workspace where an LLM can sit with a problem—following long solve attempts, searching its own past thoughts, calling specialized tools, and leaving behind a complete, verifiable research trail.
 
 Moonshine is built for workflows where **a single answer is never enough.**
 
