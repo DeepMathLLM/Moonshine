@@ -1,0 +1,2 @@
+"""Moonshine storage package."""
+

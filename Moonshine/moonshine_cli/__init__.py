@@ -1,0 +1,2 @@
+"""Moonshine CLI package."""
+
