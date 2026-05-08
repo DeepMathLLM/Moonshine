@@ -2,7 +2,7 @@
 
 **A local agent framework for autonomous mathematical research, exploration, and evolution.**
 
-Not a Q&A tool. It's a command-line workspace where an LLM can sit with a problem—following long solve attempts, searching its own past thoughts, calling specialized tools, and leaving behind a complete, verifiable research trail.
+Not a Q&A tool. It's a command-line workspace where an LLM can sit with a problem, follow long solve attempts, search its own past thoughts, call specialized tools, and leave behind a complete, verifiable research trail.
 
 Moonshine is built for workflows where **a single answer is never enough.**
 
@@ -108,18 +108,27 @@ python -m moonshine init --install-deps
 
 Moonshine stores runtime data under `MOONSHINE_HOME`.
 
-Default runtime home:
+If you do not pass `--home`, Moonshine uses the default runtime home:
 
 ```text
 ~/.moonshine
 ```
 
-Use a custom runtime home:
+Use `--home` to choose a separate runtime home. Every command that should share
+the same projects, sessions, credentials, skills, tools, and memory should use
+the same `--home` value.
 
 ```bash
 python -m moonshine --home /path/to/.moonshine init
 python -m moonshine --home /path/to/.moonshine provider --show
 python -m moonshine --home /path/to/.moonshine shell --mode chat --project general
+```
+
+On Windows, for example:
+
+```powershell
+python -m moonshine --home D:/moonshine-home init
+python -m moonshine --home D:/moonshine-home shell --mode research --project my_research_project
 ```
 
 Important runtime files:
@@ -264,6 +273,21 @@ python -m moonshine shell --mode research \
   --project my_research_project \
   --session session-xxxxxxxxxx
 ```
+
+Resume a session for one autonomous command:
+
+```bash
+python -m moonshine ask --mode research \
+  --project my_research_project \
+  --session session-xxxxxxxxxx \
+  --max-iterations 20 \
+  "Continue from the previous session and advance the current research."
+```
+
+`--session` tells Moonshine to continue from an existing session's stored
+conversation state and raw traces. It is available for both `shell` and `ask`.
+The session should belong to the same runtime home selected by `--home`, or to
+the default `~/.moonshine` when `--home` is omitted.
 
 Start with an input file:
 
@@ -602,6 +626,19 @@ Inside shell:
 /skills show <skill-slug>
 ```
 
+Skills live under the active runtime home:
+
+```text
+MOONSHINE_HOME/skills/builtin/
+MOONSHINE_HOME/skills/installed/
+```
+
+Each skill is described by a `SKILL.md` file. Moonshine reads the skill metadata,
+description, allowed tools, and `Usage Hint` section from that file so the active
+agent can decide when the skill is relevant. To add a local skill, place a skill
+folder containing `SKILL.md` under `skills/installed/`. To remove a local skill,
+remove that folder or exclude it with exposure config.
+
 ### Tools
 
 List tools:
@@ -616,6 +653,18 @@ Inside shell:
 /tools
 /tools show <tool-name>
 ```
+
+Tools live under:
+
+```text
+MOONSHINE_HOME/tools/definitions/
+MOONSHINE_HOME/tools/mcp/servers/
+```
+
+Tool definition files describe the callable tool name, handler, schema, and
+`Usage Hint`. The runtime loads those definitions and exposes matching tool
+schemas to the model. MCP server descriptors live under `tools/mcp/servers/`;
+enabled MCP descriptors can contribute additional tool schemas.
 
 ### Agents
 
@@ -666,10 +715,10 @@ Inside shell:
 
 ### Exposure Config
 
-Control exposed tools and skills in:
+Control which tools and skills are exposed in the runtime config:
 
 ```text
-config/settings.json
+MOONSHINE_HOME/config/settings.json
 ```
 
 ```json
@@ -683,8 +732,38 @@ config/settings.json
 }
 ```
 
-An empty include list means all available items are allowed except those in the
-matching exclude list.
+Rules:
+
+- Empty `*_include` means all discovered items of that kind are eligible.
+- Non-empty `*_include` means only those names are eligible.
+- `*_exclude` removes names from the eligible set.
+- Tool names should match callable tool names, such as `query_memory`,
+  `verify_overall`, or `mcp_tavily_tavily_search`.
+- Skill names should match skill slugs, such as `quality-assessor` or
+  `problem-refiner`.
+
+Example: expose only a small research tool set while hiding one skill:
+
+```json
+{
+  "exposure": {
+    "tools_include": [
+      "query_memory",
+      "read_runtime_file",
+      "assess_problem_quality",
+      "verify_overall"
+    ],
+    "tools_exclude": [],
+    "skills_include": [],
+    "skills_exclude": [
+      "problem-refiner"
+    ]
+  }
+}
+```
+
+After editing `settings.json`, start a new shell or run a new command so the
+runtime reloads the updated exposure config.
 
 ## Runtime Layout
 
