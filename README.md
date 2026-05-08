@@ -585,6 +585,8 @@ read_runtime_file(relative_path="sessions/<session-id>/provider_rounds.jsonl")
 
 ## Skills, Tools, Agents, and MCP
 
+Some skill designs in Moonshine were inspired by [Rethlas](https://github.com/frenzymath/Rethlas).
+
 ### Skills
 
 List skills:
