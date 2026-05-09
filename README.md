@@ -1,20 +1,22 @@
 # Moonshine
 
-**A local agent framework for autonomous mathematical research, exploration, and evolution.**
+**A local agent framework for autonomous mathematical research, exploration, question generation, and capability evolution.**
 
-Not a Q&A tool. It's a command-line workspace where an LLM can sit with a problem, follow long solve attempts, search its own past thoughts, call specialized tools, and leave behind a complete, verifiable research trail.
+Not a Q&A tool. Moonshine is a command-line research workspace where an LLM can develop its own mathematical questions, pursue long-form investigations, search its past thoughts, call specialized tools, and leave behind a complete, verifiable research trail.
 
-Moonshine is built for workflows where **a single answer is never enough.**
+Moonshine is built for workflows where **a single answer is never enough** — where progress often means asking better questions, testing conjectures, finding counterexamples, and refining ideas over time.
 
-It keeps working inside a named project. Resumes an old session at your request. Inspects every tool call and model trace. Retrieves verified conclusions. And double-checks before accepting any important mathematical claim.
+Moonshine explores continuously within a chosen research domain. It builds on prior sessions, follows unfinished threads, deepens promising directions, and gradually accumulates a structured body of mathematical knowledge.
+
+It inspects every tool call and model trace. Retrieves verified conclusions. Proposes new research directions. And double-checks before accepting any important mathematical claim.
 
 ---
 
 ## What you can do with it
 
 - A **persistent research notebook** with an agent living inside it
-- An **autonomous proof-search and counterexample-search loop**
-- A **project memory system** for mathematical experiments
+- An **autonomous loop for generating questions, testing conjectures, searching for proofs, and finding counterexamples**
+- A **project memory system** for mathematical experiments, partial results, and open research directions
 - An **iterative research exploration and capability evolution** framework
 - A **tool/skill harness** for custom research agents
 
