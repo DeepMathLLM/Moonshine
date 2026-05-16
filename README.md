@@ -168,7 +168,7 @@ OpenAI-compatible chat-completions endpoint.
 ```bash
 python -m moonshine provider --target main --type openai_compatible
 python -m moonshine provider --target main --base-url "https://api.openai.com/v1"
-python -m moonshine provider --target main --model "gpt-xxx"
+python -m moonshine provider --target main --model "your-model-name"
 python -m moonshine provider --target main --api-key-env "OPENAI_API_KEY"
 python -m moonshine provider --target main --set-api-key
 python -m moonshine provider --target main --stream
@@ -186,7 +186,7 @@ python -m moonshine provider --target main --set-api-key "sk-..."
 python -m moonshine provider --target main --type openai_compatible
 python -m moonshine provider --target main --base-url "https://your-provider.example/v1"
 python -m moonshine provider --target main --model "your-model-name"
-python -m moonshine provider --target main --api-key-env "YOUR_PROVIDER_API_KEY"
+python -m moonshine provider --target main --api-key-env "API_KEY"
 python -m moonshine provider --target main --set-api-key
 ```
 
@@ -211,7 +211,8 @@ Use a dedicated verification provider:
 python -m moonshine provider --target verification --dedicated
 python -m moonshine provider --target verification --type openai_compatible
 python -m moonshine provider --target verification --base-url "https://api.openai.com/v1"
-python -m moonshine provider --target verification --model "gpt-4.1-mini"
+python -m moonshine provider --target verification --model "your-model-name"
+python -m moonshine provider --target verification --api-key-env "VERIFY_API_KEY"
 python -m moonshine provider --target verification --set-api-key
 ```
 
