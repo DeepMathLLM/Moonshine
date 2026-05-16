@@ -2,7 +2,7 @@
 
 Here is a conjecture for polynomial mappings. Your goal is to find corresponding versions for neural network mappings.
 
-**The Jacobian Conjecture (Open Problem)**: A polynomial map \(F: \mathbb{C}^n \to \mathbb{C}^n\) with a constant, non-zero Jacobian determinant is globally invertible. One of the most famous open problems in algebraic geometry.
+**The Jacobian Conjecture (Open Problem)**: A polynomial map $F: \mathbb{C}^n \to \mathbb{C}^n$ with a constant, non-zero Jacobian determinant is globally invertible. One of the most famous open problems in algebraic geometry.
 
 Let \(F: \mathbb{C}^n \rightarrow \mathbb{C}^n\) be a neural network mapping with only one hidden layer and a linear output layer. The activation mapping of the hidden layer is the sigmoid function (other activation mappings may also be considered).
 
