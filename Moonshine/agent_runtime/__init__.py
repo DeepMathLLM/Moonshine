@@ -1,2 +1,0 @@
-"""Moonshine agent runtime internals."""
-
