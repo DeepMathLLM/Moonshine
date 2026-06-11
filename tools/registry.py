@@ -19,6 +19,7 @@ from moonshine.tools.catalog_tools import (
 from moonshine.tools.file_tools import read_runtime_file
 from moonshine.tools.knowledge_tools import add_knowledge, search_knowledge, store_conclusion
 from moonshine.tools.memory_tools import memory_overview
+from moonshine.tools.python_tools import install_python_package, run_python_script
 from moonshine.tools.research_tools import (
     assess_problem_quality,
     commit_turn,
@@ -91,6 +92,8 @@ class ToolRegistry(object):
             "search_sessions": lambda runtime, **kwargs: search_sessions(runtime, **kwargs),
             "query_session_records": lambda runtime, **kwargs: query_session_records(runtime, **kwargs),
             "read_runtime_file": lambda runtime, **kwargs: read_runtime_file(runtime, **kwargs),
+            "install_python_package": lambda runtime, **kwargs: install_python_package(runtime, **kwargs),
+            "run_python_script": lambda runtime, **kwargs: run_python_script(runtime, **kwargs),
             "manage_skill": lambda runtime, **kwargs: manage_skill(runtime, **kwargs),
             "pessimistic_verify": lambda runtime, **kwargs: pessimistic_verify(runtime, **kwargs),
             "verify_correctness_assumption": lambda runtime, **kwargs: verify_correctness_assumption(runtime, **kwargs),

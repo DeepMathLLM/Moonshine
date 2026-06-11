@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from moonshine.json_schema import validate_json_schema
 from moonshine.providers import OfflineProvider
 from moonshine.structured_tasks import register_structured_task
-from moonshine.utils import shorten, trim_text_to_token_budget, utc_now
+from moonshine.utils import shorten, trim_text_to_token_budget
 
 
 QUALITY_ASSESSMENT_INPUT_TOKEN_BUDGET = 100000

@@ -6,6 +6,7 @@ import io
 import gzip
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,7 +32,7 @@ from moonshine.run_agent import AgentEvent, main as run_agent_main, render_agent
 from moonshine.skills.skill_document import parse_skill_document, validate_skill_document
 from moonshine.storage.knowledge_vector_store import SQLiteVectorBackend
 from moonshine.structured_tasks import get_structured_task, list_structured_tasks
-from moonshine.utils import atomic_write, read_json, read_jsonl, read_text
+from moonshine.utils import append_jsonl, atomic_write, read_json, read_jsonl, read_text
 
 
 class ScriptedProvider(object):
@@ -275,6 +276,109 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
     def test_app_config_defaults_come_from_single_default_config_source(self):
         self.assertEqual(AppConfig().to_dict(), default_config())
 
+    def test_archival_provider_can_be_dedicated_from_main_provider(self):
+        self.app.config.provider.type = "offline"
+        self.app.config.archival_provider.inherit_from_main = False
+        self.app.config.archival_provider.type = "openai_responses"
+        self.app.config.archival_provider.model = "archive-model"
+        self.app.config.archival_provider.base_url = "https://archive.example/v1"
+        self.app.config.archival_provider.reasoning_effort = "medium"
+        self.app.config.archival_provider.reasoning_summary = "auto"
+
+        self.app._refresh_runtime_providers()
+
+        self.assertIs(self.app.agent.research_workflow.provider, self.app.archival_provider)
+        self.assertIsNot(self.app.archival_provider, self.app.provider)
+        self.assertEqual(type(self.app.archival_provider).__name__, "OpenAIResponsesProvider")
+        self.assertEqual(self.app.archival_provider.model, "archive-model")
+        self.assertEqual(self.app.archival_provider.reasoning_summary, "auto")
+
+    def test_dedicated_archival_provider_failure_falls_back_to_main_provider(self):
+        class FailingArchivalProvider(object):
+            def generate_structured(self, **kwargs):
+                raise RuntimeError("dedicated archival provider failed")
+
+        main_provider = ResearchWorkflowProvider(
+            scripted_responses=[
+                {
+                    "chunks": ["Research turn complete."],
+                    "response": ProviderResponse(content="Research turn complete."),
+                }
+            ],
+            structured_responses=[],
+            archive_responses=[
+                {
+                    "records": [
+                        {
+                            "type": "research_note",
+                            "title": "Fallback archive record",
+                            "content": "The archival fallback to the main provider succeeded.",
+                        }
+                    ]
+                }
+            ],
+        )
+        failing_archival = FailingArchivalProvider()
+        self.app.provider = main_provider
+        self.app.archival_provider = failing_archival
+        self.app.config.archival_provider.inherit_from_main = False
+        self.app.agent.provider = main_provider
+        self.app.agent.archival_provider = failing_archival
+        self.app.agent.research_workflow.provider = failing_archival
+
+        events = list(
+            self.app.agent.run_conversation_events(
+                user_message="Archive this turn.",
+                mode="research",
+                project_slug=self.state.project_slug,
+                session_id=self.state.session_id,
+            )
+        )
+
+        statuses = [event.text for event in events if event.type == "status"]
+        final_events = [event for event in events if event.type == "final"]
+        self.assertTrue(any("retrying research memory update with the main provider" in item for item in statuses))
+        self.assertTrue(any("main-provider fallback" in item for item in statuses))
+        self.assertEqual(final_events[-1].payload["reason"], "assistant_text")
+        self.assertEqual(len(main_provider.structured_calls), 1)
+        records = self.app.agent.research_workflow.research_log.records(self.state.project_slug)
+        self.assertTrue(any(item.get("title") == "Fallback archive record" for item in records))
+
+    def test_archival_provider_failure_stops_research_autopilot_when_fallback_fails(self):
+        class FailingArchivalProvider(object):
+            def generate_structured(self, **kwargs):
+                raise RuntimeError("dedicated archival provider failed")
+
+        main_provider = ScriptedProvider(
+            [
+                {
+                    "chunks": ["Research turn complete."],
+                    "response": ProviderResponse(content="Research turn complete."),
+                }
+            ]
+        )
+        failing_archival = FailingArchivalProvider()
+        self.app.provider = main_provider
+        self.app.archival_provider = failing_archival
+        self.app.config.archival_provider.inherit_from_main = False
+        self.app.agent.provider = main_provider
+        self.app.agent.archival_provider = failing_archival
+        self.app.agent.research_workflow.provider = failing_archival
+
+        events = list(
+            self.app.run_research_autopilot_events(
+                "Archive this turn.",
+                self.state,
+                max_iterations=2,
+            )
+        )
+
+        statuses = [event.text for event in events if event.type == "status"]
+        final_events = [event for event in events if event.type == "final"]
+        self.assertEqual(final_events[-1].payload["reason"], "archival_provider_offline")
+        self.assertTrue(any("archival provider is offline or unavailable" in item for item in statuses))
+        self.assertTrue(any("Research autopilot stopped because the archival provider is offline or unavailable." in item for item in statuses))
+
     def test_default_agent_rules_template_describes_executable_closure(self):
         self.assertIn("You are Moonshine", DEFAULT_AGENT_RULES_MD)
         self.assertIn("Let actual tool calls carry memory, knowledge, file, and research-state updates.", DEFAULT_AGENT_RULES_MD)
@@ -404,6 +508,416 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
 
         self.assertTrue(payload["hits"])
         self.assertTrue(any("RAW_REASONING_RECORD_SENTINEL" in item["excerpt"] for item in payload["hits"]))
+
+    def test_query_session_records_returns_non_retrieval_tool_results(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-tool-keep",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "TOOL_RESULT_KEEP_SENTINEL", "returncode": 0},
+                "error": None,
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "query_memory",
+                "call_id": "call-tool-skip",
+                "arguments": {"query": "TOOL_RESULT_SKIP_SENTINEL"},
+                "output": {"summary": "TOOL_RESULT_SKIP_SENTINEL"},
+                "error": None,
+                "created_at": "2026-05-20T00:00:01Z",
+            },
+        )
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+
+        keep_payload = self.app.tool_manager.dispatch(
+            "query_session_records",
+            {"query": "TOOL_RESULT_KEEP_SENTINEL", "limit": 5},
+            runtime,
+        )
+        skip_payload = self.app.tool_manager.dispatch(
+            "query_session_records",
+            {"query": "TOOL_RESULT_SKIP_SENTINEL", "limit": 5},
+            runtime,
+        )
+
+        self.assertTrue(keep_payload["matched_tool_results"])
+        self.assertIn("TOOL_RESULT_KEEP_SENTINEL", keep_payload["tool_results_content"])
+        self.assertEqual(keep_payload["tool_results_retrieval"]["source_unit"], "complete_tool_result")
+        self.assertIn("query_memory", keep_payload["tool_results_retrieval"]["excluded_tools"])
+        self.assertFalse(skip_payload["matched_tool_results"])
+        self.assertNotIn("TOOL_RESULT_SKIP_SENTINEL", skip_payload["tool_results_content"])
+
+    def test_tool_events_jsonl_is_manifest_and_full_payload_is_archived(self):
+        large_output = "ARCHIVED_TOOL_SENTINEL " + ("x" * 5000)
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-archive-tool",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": large_output},
+                "error": None,
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+
+        manifest_rows = read_jsonl(self.app.paths.session_tool_events_file(self.state.session_id))
+        self.assertTrue(manifest_rows)
+        manifest = manifest_rows[-1]
+        self.assertIn("archive_path", manifest)
+        self.assertNotIn(large_output, json.dumps(manifest, ensure_ascii=False))
+
+        restored = self.app.session_store.get_tool_events(self.state.session_id)[-1]
+        self.assertEqual(restored["tool"], "run_python_script")
+        self.assertIn("ARCHIVED_TOOL_SENTINEL", restored["output"]["stdout"])
+        self.assertTrue((self.app.paths.home / manifest["archive_path"]).exists())
+
+    def test_tool_events_are_indexed_from_original_payloads_excluding_retrieval_tools(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "query_memory",
+                "call_id": "call-tool-index-skip",
+                "arguments": {"query": "TOOL_INDEX_SKIP_SENTINEL"},
+                "output": {"summary": "TOOL_INDEX_SKIP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-tool-index-keep",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "TOOL_INDEX_KEEP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:01Z",
+            },
+        )
+
+        with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
+            rows = connection.execute(
+                """
+                SELECT tool, search_text, metadata_json FROM tool_events
+                WHERE session_id = ?
+                """,
+                (self.state.session_id,),
+            ).fetchall()
+        rendered = json.dumps([tuple(row) for row in rows], ensure_ascii=False)
+
+        self.assertIn("run_python_script", rendered)
+        self.assertIn("TOOL_INDEX_KEEP_SENTINEL", rendered)
+        self.assertTrue(any(json.loads(row[2]).get("index_version") == 2 for row in rows))
+        self.assertNotIn("TOOL_INDEX_SKIP_SENTINEL", rendered)
+
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+        payload = self.app.tool_manager.dispatch(
+            "query_session_records",
+            {"query": "TOOL_INDEX_KEEP_SENTINEL", "limit": 5},
+            runtime,
+        )
+
+        self.assertTrue(payload["matched_tool_results"])
+        self.assertIn("TOOL_INDEX_KEEP_SENTINEL", payload["tool_results_content"])
+
+    def test_tool_event_search_filters_stale_indexed_retrieval_tool_rows(self):
+        self.app.session_store.db.upsert_tool_event_index(
+            session_id=self.state.session_id,
+            event_id="stale-query-memory-row",
+            tool="query_memory",
+            call_id="call-stale-query-memory",
+            created_at="2026-05-20T00:00:00Z",
+            archive_path="",
+            status="ok",
+            search_text="STALE_RETRIEVAL_TOOL_INDEX_SENTINEL",
+            metadata_json=json.dumps({"index_version": 2}, ensure_ascii=False),
+        )
+        self.app.session_store.db.upsert_tool_event_index(
+            session_id=self.state.session_id,
+            event_id="normal-tool-row",
+            tool="run_python_script",
+            call_id="call-normal-tool",
+            created_at="2026-05-20T00:00:01Z",
+            archive_path="",
+            status="ok",
+            search_text="NORMAL_TOOL_INDEX_SENTINEL",
+            metadata_json=json.dumps({"index_version": 2}, ensure_ascii=False),
+        )
+
+        skipped = self.app.session_store.search_tool_events(
+            self.state.session_id,
+            "STALE_RETRIEVAL_TOOL_INDEX_SENTINEL",
+            limit=5,
+        )
+        kept = self.app.session_store.search_tool_events(
+            self.state.session_id,
+            "NORMAL_TOOL_INDEX_SENTINEL",
+            limit=5,
+        )
+
+        self.assertFalse(skipped)
+        self.assertTrue(kept)
+        self.assertEqual(kept[0]["tool"], "run_python_script")
+
+    def test_legacy_inline_tool_events_are_lazily_indexed(self):
+        append_jsonl(
+            self.app.paths.session_tool_events_file(self.state.session_id),
+            {
+                "tool": "run_python_script",
+                "call_id": "call-legacy-inline",
+                "arguments": {"path": "experiments/legacy.py"},
+                "output": {"stdout": "LEGACY_INLINE_TOOL_SENTINEL"},
+                "created_at": "2026-05-20T00:00:02Z",
+            },
+        )
+
+        matches = self.app.session_store.search_tool_events(
+            self.state.session_id,
+            "LEGACY_INLINE_TOOL_SENTINEL",
+            limit=5,
+        )
+
+        self.assertTrue(matches)
+        self.assertIn("LEGACY_INLINE_TOOL_SENTINEL", matches[0]["_search_text"])
+        self.assertEqual(matches[0]["event_id"], "call-legacy-inline")
+
+    def test_old_tool_event_index_version_is_rebuilt(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-rebuild-index",
+                "arguments": {"path": "experiments/rebuild.py"},
+                "output": {"stdout": "REBUILT_TOOL_INDEX_SENTINEL"},
+                "created_at": "2026-05-20T00:00:03Z",
+            },
+        )
+        self.app.session_store.db.upsert_tool_event_index(
+            session_id=self.state.session_id,
+            event_id="call-rebuild-index",
+            tool="run_python_script",
+            call_id="call-rebuild-index",
+            created_at="2026-05-20T00:00:03Z",
+            archive_path="",
+            status="ok",
+            search_text="OLD_TOOL_INDEX_TEXT",
+            metadata_json=json.dumps({"index_version": 1}, ensure_ascii=False),
+        )
+
+        matches = self.app.session_store.search_tool_events(
+            self.state.session_id,
+            "REBUILT_TOOL_INDEX_SENTINEL",
+            limit=5,
+        )
+
+        self.assertTrue(matches)
+        self.assertIn("REBUILT_TOOL_INDEX_SENTINEL", matches[0]["_search_text"])
+        with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
+            row = connection.execute(
+                """
+                SELECT metadata_json FROM tool_events
+                WHERE session_id = ? AND event_id = ?
+                """,
+                (self.state.session_id, "call-rebuild-index"),
+            ).fetchone()
+        self.assertEqual(json.loads(row[0])["index_version"], 2)
+
+    def test_query_session_records_hard_truncates_tool_results_without_compression(self):
+        import moonshine.tools.session_tools as session_tools_module
+
+        previous_budget = session_tools_module.TOOL_RESULT_VISIBLE_TOKEN_BUDGET
+        session_tools_module.TOOL_RESULT_VISIBLE_TOKEN_BUDGET = 120
+        self.addCleanup(setattr, session_tools_module, "TOOL_RESULT_VISIBLE_TOKEN_BUDGET", previous_budget)
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-large-tool",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "TOOL_TRUNCATE_SENTINEL " + ("long-output " * 400)},
+                "error": None,
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+
+        payload = self.app.tool_manager.dispatch(
+            "query_session_records",
+            {"query": "TOOL_TRUNCATE_SENTINEL", "limit": 5},
+            runtime,
+        )
+
+        self.assertTrue(payload["matched_tool_results"])
+        self.assertEqual(payload["tool_results_retrieval"]["content_mode"], "truncated_complete_tool_result")
+        self.assertTrue(payload["tool_results_retrieval"]["truncated"])
+        self.assertIn("TOOL_TRUNCATE_SENTINEL", payload["tool_results_content"])
+        self.assertNotIn("Compressed Tool Result Chunk", payload["tool_results_content"])
+
+    def test_retrieval_tool_events_are_not_indexed_as_searchable_conversation_events(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "query_memory",
+                "call_id": "call-query-memory",
+                "arguments": {"query": "INDEX_SKIP_SENTINEL"},
+                "output": {"summary": "INDEX_SKIP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-run-python",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "INDEX_KEEP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:01Z",
+            },
+        )
+
+        skipped = self.app.session_store.search_conversation_events(
+            "INDEX_SKIP_SENTINEL",
+            project_slug="anderson_conjecture",
+            limit=5,
+        )
+        kept = self.app.session_store.search_conversation_events(
+            "INDEX_KEEP_SENTINEL",
+            project_slug="anderson_conjecture",
+            limit=5,
+        )
+
+        self.assertFalse(skipped)
+        self.assertFalse(kept)
+
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+        payload = self.app.tool_manager.dispatch(
+            "query_session_records",
+            {"query": "INDEX_KEEP_SENTINEL", "limit": 5},
+            runtime,
+        )
+        self.assertIn("INDEX_KEEP_SENTINEL", payload["tool_results_content"])
+
+    def test_legacy_retrieval_tool_events_are_filtered_from_event_search(self):
+        self.app.session_store.append_conversation_event(
+            self.state.session_id,
+            event_kind="tool_result",
+            role="tool",
+            content="Tool: query_memory\nOutput: LEGACY_INDEX_SKIP_SENTINEL",
+            payload={
+                "tool": "query_memory",
+                "arguments": {"query": "LEGACY_INDEX_SKIP_SENTINEL"},
+                "output": {"summary": "LEGACY_INDEX_SKIP_SENTINEL"},
+            },
+        )
+        self.app.session_store.append_conversation_event(
+            self.state.session_id,
+            event_kind="tool_result",
+            role="tool",
+            content="Tool: run_python_script\nOutput: LEGACY_INDEX_KEEP_SENTINEL",
+            payload={
+                "tool": "run_python_script",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "LEGACY_INDEX_KEEP_SENTINEL"},
+            },
+        )
+
+        skipped = self.app.session_store.search_conversation_events(
+            "LEGACY_INDEX_SKIP_SENTINEL",
+            project_slug="anderson_conjecture",
+            limit=5,
+        )
+        kept = self.app.session_store.search_conversation_events(
+            "LEGACY_INDEX_KEEP_SENTINEL",
+            project_slug="anderson_conjecture",
+            limit=5,
+        )
+
+        self.assertFalse(skipped)
+        self.assertFalse(kept)
+
+    def test_query_memory_related_tool_events_use_filtered_restored_payloads(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "query_memory",
+                "call_id": "call-related-skip",
+                "arguments": {"query": "RELATED_SKIP_SENTINEL"},
+                "output": {"summary": "RELATED_SKIP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:00Z",
+            },
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-related-keep",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "RELATED_KEEP_SENTINEL"},
+                "created_at": "2026-05-20T00:00:01Z",
+            },
+        )
+
+        with mock.patch.object(self.app.session_store, "get_tool_events", side_effect=AssertionError("scan not allowed")):
+            related = self.app.context_manager._select_related_tool_events(
+                session_id=self.state.session_id,
+                query="RELATED_KEEP_SENTINEL RELATED_SKIP_SENTINEL",
+                anchor_text="RELATED_KEEP_SENTINEL",
+                anchor_created_at="2026-05-20T00:00:01Z",
+                limit=5,
+            )
+        rendered = "\n\n".join(related)
+
+        self.assertIn("RELATED_KEEP_SENTINEL", rendered)
+        self.assertIn("archive_path:", rendered)
+        self.assertNotIn("RELATED_SKIP_SENTINEL", rendered)
+
+    def test_query_memory_directly_recalls_indexed_tool_event_hits(self):
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-direct-tool-hit",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "DIRECT_TOOL_EVENT_HIT_SENTINEL"},
+                "created_at": "2026-05-20T00:00:01Z",
+            },
+        )
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+
+        payload = self.app.tool_manager.dispatch(
+            "query_memory",
+            {"query": "DIRECT_TOOL_EVENT_HIT_SENTINEL"},
+            runtime,
+        )
+        rendered = json.dumps(payload, ensure_ascii=False)
+
+        self.assertTrue(payload["tool_event_hits"])
+        self.assertIn("DIRECT_TOOL_EVENT_HIT_SENTINEL", rendered)
+        self.assertTrue(any(item["source"] == "tool-event" for item in payload["compressed_windows"]))
 
     def test_knowledge_layer_accepts_manual_entries(self):
         response = self.app.execute_command(
@@ -5120,6 +5634,101 @@ while True:
         self.assertEqual(result["root"], str(reloaded.paths.home))
         self.assertIn("cross project exact fact", result["content"])
 
+    def test_run_python_script_executes_project_local_script(self):
+        reloaded = MoonshineApp(home=self.temp_dir.name)
+        project_slug = "general"
+        script = reloaded.paths.project_dir(project_slug) / "experiments" / "check.py"
+        atomic_write(
+            script,
+            "import os, sys\n"
+            "print('cwd=' + os.path.basename(os.getcwd()))\n"
+            "print('args=' + ','.join(sys.argv[1:]))\n",
+        )
+        runtime = reloaded.agent._build_runtime(mode="research", project_slug=project_slug, session_id=self.state.session_id)
+
+        result = reloaded.tool_manager.dispatch(
+            "run_python_script",
+            {"path": "experiments/check.py", "args": ["alpha", "beta"], "timeout_seconds": 5},
+            runtime,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["relative_path"], str(Path("experiments") / "check.py"))
+        self.assertIn("cwd=general", result["stdout"])
+        self.assertIn("args=alpha,beta", result["stdout"])
+
+    def test_run_python_script_is_exposed_with_usage_hint(self):
+        reloaded = MoonshineApp(home=self.temp_dir.name)
+        schema_names = [item["name"] for item in reloaded.tool_manager.schemas(mode="research")]
+        tool_index = reloaded.tool_manager.build_prompt_index(mode="research")
+
+        self.assertIn("run_python_script", schema_names)
+        self.assertIn("install_python_package", schema_names)
+        self.assertIn("run_python_script", tool_index)
+        self.assertIn("install_python_package", tool_index)
+        self.assertIn("bounded Python script", tool_index)
+        self.assertIn("numerical evidence", tool_index)
+        self.assertIn("missing libraries", tool_index)
+
+    def test_run_python_script_rejects_paths_outside_project(self):
+        reloaded = MoonshineApp(home=self.temp_dir.name)
+        project_slug = "general"
+        outside = Path(self.temp_dir.name) / "outside.py"
+        atomic_write(outside, "print('outside')\n")
+        runtime = reloaded.agent._build_runtime(mode="research", project_slug=project_slug, session_id=self.state.session_id)
+
+        with self.assertRaises(ValueError):
+            reloaded.tool_manager.dispatch(
+                "run_python_script",
+                {"path": str(outside)},
+                runtime,
+            )
+
+    def test_install_python_package_uses_current_interpreter_pip(self):
+        reloaded = MoonshineApp(home=self.temp_dir.name)
+        project_slug = "general"
+        runtime = reloaded.agent._build_runtime(mode="research", project_slug=project_slug, session_id=self.state.session_id)
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="installed ok",
+            stderr="",
+        )
+
+        with mock.patch("moonshine.tools.python_tools.subprocess.run", return_value=completed) as run_mock:
+            result = reloaded.tool_manager.dispatch(
+                "install_python_package",
+                {"packages": ["sympy>=1.12"], "timeout_seconds": 7},
+                runtime,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["packages"], ["sympy>=1.12"])
+        self.assertEqual(result["stdout"], "installed ok")
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:4], [sys.executable, "-m", "pip", "install"])
+        self.assertEqual(command[-1], "sympy>=1.12")
+        self.assertEqual(run_mock.call_args.kwargs["cwd"], str(reloaded.paths.project_dir(project_slug)))
+        self.assertFalse(run_mock.call_args.kwargs["shell"])
+
+    def test_install_python_package_rejects_pip_options_and_paths(self):
+        reloaded = MoonshineApp(home=self.temp_dir.name)
+        runtime = reloaded.agent._build_runtime(mode="research", project_slug="general", session_id=self.state.session_id)
+
+        with self.assertRaises(ValueError):
+            reloaded.tool_manager.dispatch(
+                "install_python_package",
+                {"packages": ["-r", "requirements.txt"]},
+                runtime,
+            )
+        with self.assertRaises(ValueError):
+            reloaded.tool_manager.dispatch(
+                "install_python_package",
+                {"packages": ["../local-package"]},
+                runtime,
+            )
+
     def test_mcp_filesystem_normalizes_legacy_project_prefix_for_writes(self):
         reloaded = MoonshineApp(home=self.temp_dir.name)
         project_slug = "general"
@@ -6590,8 +7199,8 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
                     "response": ProviderResponse(
                         tool_calls=[
                             ProviderToolCall(
-                                name="query_memory",
-                                arguments={"query": "local criteria", "project_slug": "anderson_conjecture"},
+                                name="read_runtime_file",
+                                arguments={"relative_path": "workspace/problem.md"},
                                 call_id="call-1",
                             )
                         ]
