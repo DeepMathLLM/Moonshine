@@ -1,199 +1,337 @@
 # Moonshine
 
-**A local agent framework for autonomous mathematical research, exploration, question generation, and capability evolution.**
+**Moonshine is an autonomous mathematical research agent whose central
+objective is to generate conjectures.**
 
-Not a Q&A tool. Moonshine is a command-line research workspace where an LLM can develop its own mathematical questions, pursue long-form investigations, search its past thoughts, call specialized tools, and leave behind a complete, verifiable research trail.
+Its core capability is to extract structure from classical problems, distill
+new concepts, and formulate conjectures of mathematical significance. Rather
+than treating the solution of a single proposition as its endpoint, Moonshine
+is built to grow an extensible theoretical framework through conjecture
+generation, bridge building, obstacle identification, and verification.
 
-Moonshine is built for workflows where **a single answer is never enough** — where progress often means asking better questions, testing conjectures, finding counterexamples, and refining ideas over time.
+Moonshine can also run as a normal chat assistant, but its main strength is
+research mode: a persistent project workspace where the agent can explore a
+problem across many turns and sessions while keeping a traceable research
+record.
 
-Moonshine explores continuously within a chosen research domain. It builds on prior sessions, follows unfinished threads, deepens promising directions, and gradually accumulates a structured body of mathematical knowledge.
+## Highlights
 
-It inspects every tool call and model trace. Retrieves verified conclusions. Proposes new research directions. And double-checks before accepting any important mathematical claim.
-
----
-
-## What you can do with it
-
-- A **persistent research notebook** with an agent living inside it
-- An **autonomous loop for generating questions, testing conjectures, searching for proofs, and finding counterexamples**
-- A **project memory system** for mathematical experiments, partial results, and open research directions
-- An **iterative research exploration and capability evolution** framework
-- A **tool/skill harness** for custom research agents
-
----
+- Conjecture generation from mathematical structure and classical problems.
+- Bridge building between problems, methods, concepts, and examples.
+- Obstacle identification through failed paths and counterexample search.
+- Chat mode and research mode from one CLI.
+- Persistent projects, sessions, memory, and knowledge.
+- Autonomous research iteration with configurable iteration limits.
+- Project research logs with typed records and by-type Markdown views.
+- Verification tools for assumptions, computations, logic, and final results.
+- Independent provider slots for main, verification, and archival calls.
+- OpenAI-compatible chat-completions, OpenAI Responses, Azure OpenAI, and offline mode.
+- Reasoning effort and reasoning summary settings for compatible providers.
+- Session continuation with raw message, provider-round, and tool-event traces.
+- Unified session retrieval for messages and non-retrieval tool results.
+- Indexed tool-event retrieval with large payloads kept recoverable.
+- Markdown-defined agents, skills, tools, and MCP server descriptors.
+- Optional Tavily MCP integration for web search and extraction.
+- Project-local Python script execution and package installation tools.
+- Exposure controls for selecting which skills and tools are visible.
 
 ## Contents
 
-- [Moonshine](#moonshine)
-  - [What you can do with it](#what-you-can-do-with-it)
-  - [Contents](#contents)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-  - [Initial Setup](#initial-setup)
-  - [Provider Configuration](#provider-configuration)
-    - [OpenAI API](#openai-api)
-    - [Other OpenAI-Compatible Providers](#other-openai-compatible-providers)
-    - [Azure OpenAI](#azure-openai)
-    - [Verification Provider](#verification-provider)
-    - [Useful Provider Commands](#useful-provider-commands)
-  - [Quick Start](#quick-start)
-  - [Chat Mode](#chat-mode)
-  - [Research Mode](#research-mode)
-    - [Suggested Research Prompts](#suggested-research-prompts)
-    - [Research Verification](#research-verification)
-  - [Working With Files](#working-with-files)
-    - [Project Files](#project-files)
-    - [Input Files](#input-files)
-    - [Path Rules](#path-rules)
-  - [Memory and Retrieval](#memory-and-retrieval)
-    - [Project Research Log](#project-research-log)
-    - [Search Project Memory](#search-project-memory)
-    - [Search Global Knowledge](#search-global-knowledge)
-    - [Search Raw Session History](#search-raw-session-history)
-  - [Skills, Tools, Agents, and MCP](#skills-tools-agents-and-mcp)
-    - [Skills](#skills)
-    - [Tools](#tools)
-    - [Agents](#agents)
-    - [MCP](#mcp)
-    - [Exposure Config](#exposure-config)
-  - [Runtime Layout](#runtime-layout)
-  - [Testing](#testing)
-  - [Troubleshooting](#troubleshooting)
-  - [Status](#status)
+- [Requirements](#requirements)
+- [From Install to First Run](#from-install-to-first-run)
+- [Runtime Home](#runtime-home)
+- [Provider Setup](#provider-setup)
+- [Daily Use After Setup](#daily-use-after-setup)
+- [Chat Mode](#chat-mode)
+- [Research Mode](#research-mode)
+- [Sessions](#sessions)
+- [Memory and Retrieval](#memory-and-retrieval)
+- [Verification](#verification)
+- [Files and Paths](#files-and-paths)
+- [Skills, Tools, Agents, and MCP](#skills-tools-agents-and-mcp)
+- [Python Tools](#python-tools)
+- [Runtime Layout](#runtime-layout)
+- [Latest Updates](#latest-updates)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
 
 ## Requirements
 
-Required:
-
 - Python 3.8+
-- A terminal/shell environment
-- A configured LLM provider, unless you only want to inspect the CLI in offline mode
+- A terminal environment
+- An LLM provider for live model calls
 
-Recommended optional dependencies are installed with:
+Offline mode is available for inspecting the CLI and runtime layout without an
+API key.
+
+## From Install to First Run
+
+This is the recommended path from a fresh checkout to a working Moonshine run.
+For detailed options, see [Runtime Home](#runtime-home),
+[Provider Setup](#provider-setup), [Research Mode](#research-mode), and
+[Memory and Retrieval](#memory-and-retrieval) after this first-run path.
+
+### 1. Install Moonshine
+
+From the repository root:
 
 ```bash
 python -m pip install -e ".[all]" --no-build-isolation
 ```
 
-The `all` extra includes optional packages used by token counting, vector search,
-and workflow-related features.
-
-## Installation
-
-From the package directory:
+Optional but recommended before installation:
 
 ```bash
-cd moonshine
 python -m pip install -U pip setuptools wheel
-python -m pip install -e ".[all]" --no-build-isolation
 ```
 
-After installation, initialize the runtime home:
+### 2. Initialize a runtime home
+
+Use the default runtime home:
 
 ```bash
 python -m moonshine init
 ```
 
-Check optional dependency status:
+Or choose one explicitly:
 
 ```bash
-python -m moonshine init --check-deps
+python -m moonshine --home /home/ubuntu/.moonshine init
+```
+
+Use the same `--home` value for later commands that should share the same
+projects, sessions, credentials, memory, skills, tools, and agents.
+
+### 3. Configure the main provider
+
+You must configure a live provider before expecting chat or research mode to
+make real LLM calls.
+
+Moonshine has three provider slots:
+
+- `main`: normal chat and research-agent calls
+- `verification`: verification and problem-quality calls
+- `archival`: research-log archival calls
+
+By default, `verification` and `archival` inherit `main`, so a first run only
+needs the `main` provider. Dedicated secondary providers are optional; see
+[Verification Provider](#verification-provider) and
+[Archival Provider](#archival-provider).
+
+Choose one main provider family:
+
+OpenAI-compatible chat completions:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --openai-compatible
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --base-url "https://api.openai.com/v1"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --model "your-model"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "OPENAI_API_KEY"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+```
+
+OpenAI Responses:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --openai-responses
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --base-url "https://api.openai.com/v1"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --model "your-model"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "OPENAI_API_KEY"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+```
+
+Azure OpenAI:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --azure-openai
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --endpoint "https://your-resource.openai.azure.com/"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --deployment "your-deployment"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-version "2024-12-01-preview"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "AZURE_OPENAI_API_KEY"
+python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+```
+
+### 4. Check the provider
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine provider --show
+```
+
+Confirm that:
+
+- `main` is not `offline`
+- the model name is correct
+- the base URL or Azure endpoint is correct
+- the API key environment name is correct
+
+### 5. Start research mode
+
+Research mode is Moonshine's main mode. It creates a persistent project
+workspace for conjecture generation, bridge building, obstacle identification,
+verification, and long-running mathematical exploration. For details, see
+[Research Mode](#research-mode).
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine shell --mode research --project my_research_project
+```
+
+Or start from an input file:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine shell --mode research \
+  --project my_research_project \
+  --input-file /path/to/problem-or-notes.md
+```
+
+### 6. Use chat mode when needed
+
+Chat mode is for ordinary assistant turns, lightweight explanations, and
+general work that does not need the full research workflow. For details, see
+[Chat Mode](#chat-mode).
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine shell --mode chat --project general
+```
+
+One-shot chat call:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine ask --mode chat --project general "Explain Nakayama's lemma."
+```
+
+### 7. Optional checks
+
+Check optional dependencies:
+
+```bash
+python -m moonshine --home /home/ubuntu/.moonshine init --check-deps
 ```
 
 Install optional dependencies from the CLI:
 
 ```bash
-python -m moonshine init --install-deps
+python -m moonshine --home /home/ubuntu/.moonshine init --install-deps
 ```
 
-## Initial Setup
+## Runtime Home
 
-Moonshine stores runtime data under `MOONSHINE_HOME`.
+Moonshine stores runtime data under a runtime home.
 
-If you do not pass `--home`, Moonshine uses the default runtime home:
+Default:
 
 ```text
 ~/.moonshine
 ```
 
-Use `--home` to choose a separate runtime home. Every command that should share
-the same projects, sessions, credentials, skills, tools, and memory should use
-the same `--home` value.
+Use `--home` when you want a specific runtime directory:
 
 ```bash
-python -m moonshine --home /path/to/.moonshine init
-python -m moonshine --home /path/to/.moonshine provider --show
-python -m moonshine --home /path/to/.moonshine shell --mode chat --project general
+python -m moonshine --home /home/ubuntu/.moonshine init
+python -m moonshine --home /home/ubuntu/.moonshine provider --show
 ```
 
-On Windows, for example:
+On Windows:
 
 ```powershell
 python -m moonshine --home D:/moonshine-home init
-python -m moonshine --home D:/moonshine-home shell --mode research --project my_research_project
+python -m moonshine --home D:/moonshine-home provider --show
 ```
 
-Important runtime files:
+Use the same `--home` for commands that should share projects, sessions,
+credentials, memory, skills, tools, and agents.
+
+Important files under the runtime home:
 
 ```text
-config/settings.json       # non-secret configuration
+config/settings.json       # provider, memory, context, and exposure config
 config/credentials.json    # locally stored API keys
-projects/                  # research projects
-sessions/                  # raw session records
-knowledge/                 # global reusable conclusions
-skills/                    # runtime skill definitions
-tools/                     # runtime tool and MCP definitions
-agents/                    # runtime agent definitions
+projects/                  # project workspaces and research memory
+sessions/                  # raw session traces
+databases/sessions.sqlite3 # unified session index
+knowledge/                 # reusable verified conclusions
+memory/                    # dynamic memory
+agents/                    # agent definitions
+skills/                    # skill definitions
+tools/                     # tool and MCP definitions
 ```
 
-Inspect the current provider setup:
+## Provider Setup
+
+The examples in this reference section omit `--home`. Add the same `--home`
+value you used during initialization when you are not using the default
+`~/.moonshine` runtime home.
+
+For first-time setup, configure `main` first. `verification` and `archival`
+inherit `main` unless you make them dedicated.
+
+Show current provider settings:
 
 ```bash
 python -m moonshine provider --show
 ```
 
-## Provider Configuration
+Moonshine has three provider slots:
 
-Moonshine supports:
+- `main`: normal assistant and research-agent calls
+- `verification`: verification and problem-quality calls
+- `archival`: research-log archival calls
 
-- `offline`
-- `azure_openai`
-- `openai_compatible`
+By default, `verification` and `archival` inherit `main`.
 
-Use `openai_compatible` for OpenAI's API and for other services that expose an
-OpenAI-compatible chat-completions endpoint.
+### OpenAI-Compatible Chat Completions
 
-### OpenAI API
+Use this for OpenAI-compatible `/chat/completions` APIs:
 
 ```bash
-python -m moonshine provider --target main --type openai_compatible
+python -m moonshine provider --target main --openai-compatible
 python -m moonshine provider --target main --base-url "https://api.openai.com/v1"
-python -m moonshine provider --target main --model "your-model-name"
+python -m moonshine provider --target main --model "your-model"
 python -m moonshine provider --target main --api-key-env "OPENAI_API_KEY"
 python -m moonshine provider --target main --set-api-key
-python -m moonshine provider --target main --stream
 ```
 
-`--set-api-key` can be used interactively, or you can pass the key directly:
+### OpenAI Responses
+
+Use this for Responses-compatible APIs:
 
 ```bash
-python -m moonshine provider --target main --set-api-key "sk-..."
-```
-
-### Other OpenAI-Compatible Providers
-
-```bash
-python -m moonshine provider --target main --type openai_compatible
-python -m moonshine provider --target main --base-url "https://your-provider.example/v1"
-python -m moonshine provider --target main --model "your-model-name"
-python -m moonshine provider --target main --api-key-env "API_KEY"
+python -m moonshine provider --target main --openai-responses
+python -m moonshine provider --target main --base-url "https://api.openai.com/v1"
+python -m moonshine provider --target main --model "your-model"
+python -m moonshine provider --target main --api-key-env "OPENAI_API_KEY"
 python -m moonshine provider --target main --set-api-key
+```
+
+Set reasoning options for compatible Responses models:
+
+```bash
+python -m moonshine provider --target main --reasoning-effort high
+python -m moonshine provider --target main --reasoning-summary detailed
+```
+
+Supported `--reasoning-effort` values:
+
+```text
+minimal, low, medium, high, xhigh
+```
+
+Supported `--reasoning-summary` values:
+
+```text
+auto, concise, detailed
+```
+
+Clear either setting by passing an empty value:
+
+```bash
+python -m moonshine provider --target main --reasoning-effort ""
+python -m moonshine provider --target main --reasoning-summary ""
 ```
 
 ### Azure OpenAI
 
 ```bash
-python -m moonshine provider --target main --type azure_openai
+python -m moonshine provider --target main --azure-openai
 python -m moonshine provider --target main --endpoint "https://your-resource.openai.azure.com/"
 python -m moonshine provider --target main --deployment "your-deployment"
 python -m moonshine provider --target main --api-version "2024-12-01-preview"
@@ -203,96 +341,83 @@ python -m moonshine provider --target main --set-api-key
 
 ### Verification Provider
 
-Verification uses the main provider by default.
-
-Use a dedicated verification provider:
-
-```bash
-python -m moonshine provider --target verification --dedicated
-python -m moonshine provider --target verification --type openai_compatible
-python -m moonshine provider --target verification --base-url "https://api.openai.com/v1"
-python -m moonshine provider --target verification --model "your-model-name"
-python -m moonshine provider --target verification --api-key-env "VERIFY_API_KEY"
-python -m moonshine provider --target verification --set-api-key
-```
-
-Return verification to the main provider:
+Use the main provider for verification:
 
 ```bash
 python -m moonshine provider --target verification --inherit-main
 ```
 
+Use a dedicated verifier:
+
+```bash
+python -m moonshine provider --target verification --dedicated
+python -m moonshine provider --target verification --openai-compatible
+python -m moonshine provider --target verification --base-url "https://api.openai.com/v1"
+python -m moonshine provider --target verification --model "your-verifier-model"
+python -m moonshine provider --target verification --api-key-env "VERIFY_API_KEY"
+python -m moonshine provider --target verification --set-api-key
+```
+
+Verification calls use structured output. If verification inherits `main`, it
+uses the same provider type and settings as `main`, including Responses and
+reasoning settings when configured.
+
+### Archival Provider
+
+Use the main provider for research archival:
+
+```bash
+python -m moonshine provider --target archival --inherit-main
+```
+
+Use a dedicated archival provider:
+
+```bash
+python -m moonshine provider --target archival --dedicated
+python -m moonshine provider --target archival --openai-responses
+python -m moonshine provider --target archival --base-url "https://api.openai.com/v1"
+python -m moonshine provider --target archival --model "your-archive-model"
+python -m moonshine provider --target archival --api-key-env "ARCHIVE_API_KEY"
+python -m moonshine provider --target archival --set-api-key
+```
+
+If a dedicated archival provider fails, Moonshine retries the archival call with
+the main provider. If both fail, research autopilot stops and reports the error.
+
 ### Useful Provider Commands
 
 ```bash
 python -m moonshine provider --show
-python -m moonshine provider --target main --no-stream
 python -m moonshine provider --target main --stream
+python -m moonshine provider --target main --no-stream
 python -m moonshine provider --target main --temperature 0.2
 python -m moonshine provider --target main --clear-temperature
+python -m moonshine provider --target main --structured-output-format json_schema
 python -m moonshine provider --target main --max-context-tokens 0
 ```
 
-## Quick Start
+## Daily Use After Setup
 
-Start a normal chat session:
+After installation and provider setup, the common commands are:
 
-```bash
-python -m moonshine shell --mode chat --project general
-```
+Start research mode:
 
-Ask one question and exit:
-
-```bash
-python -m moonshine ask --mode chat --project general "Explain Nakayama's lemma."
-```
-
-Start an autonomous research session:
+Research mode is for persistent project work: conjectures, proof attempts,
+counterexamples, verification, and reusable research memory. See
+[Research Mode](#research-mode) for the full workflow.
 
 ```bash
 python -m moonshine shell --mode research --project my_research_project
 ```
 
-Run an autonomous research prompt:
+Run one autonomous research prompt:
 
 ```bash
 python -m moonshine ask --mode research --project my_research_project \
-  --max-iterations 20 \
   "Study the current problem and continue the research."
 ```
 
-Run one research turn only:
-
-```bash
-python -m moonshine ask --mode research --project my_research_project \
-  --interactive \
-  "Read the current notes and summarize the next step."
-```
-
-Resume a session:
-
-```bash
-python -m moonshine shell --mode research \
-  --project my_research_project \
-  --session session-xxxxxxxxxx
-```
-
-Resume a session for one autonomous command:
-
-```bash
-python -m moonshine ask --mode research \
-  --project my_research_project \
-  --session session-xxxxxxxxxx \
-  --max-iterations 20 \
-  "Continue from the previous session and advance the current research."
-```
-
-`--session` tells Moonshine to continue from an existing session's stored
-conversation state and raw traces. It is available for both `shell` and `ask`.
-The session should belong to the same runtime home selected by `--home`, or to
-the default `~/.moonshine` when `--home` is omitted.
-
-Start with an input file:
+Start research mode from an input file:
 
 ```bash
 python -m moonshine shell --mode research \
@@ -300,24 +425,33 @@ python -m moonshine shell --mode research \
   --input-file /path/to/problem-or-notes.md
 ```
 
-## Chat Mode
+Use chat mode for ordinary assistant work:
 
-Chat mode is for ordinary assistant use.
-
-Start chat mode:
+Chat mode is for general conversation, explanations, and tasks that do not need
+project research automation. See [Chat Mode](#chat-mode) for details.
 
 ```bash
 python -m moonshine shell --mode chat --project general
 ```
 
-Run a one-shot chat prompt:
+Ask one chat question and exit:
 
 ```bash
-python -m moonshine ask --mode chat --project general \
-  "Compare Noetherian and Artinian rings."
+python -m moonshine ask --mode chat --project general "Explain Nakayama's lemma."
 ```
 
-Useful chat-mode commands:
+For session continuation, see [Sessions](#sessions). For research memory and
+retrieval, see [Memory and Retrieval](#memory-and-retrieval).
+
+## Chat Mode
+
+Chat mode is for ordinary assistant work with persistent session history.
+
+```bash
+python -m moonshine shell --mode chat --project general
+```
+
+Useful shell commands:
 
 ```text
 /help
@@ -327,36 +461,37 @@ Useful chat-mode commands:
 /knowledge search <query>
 /skills
 /tools
+/mcp
 /exit
 ```
 
 ## Research Mode
 
-Research mode is for project-based mathematical work.
+Research mode is for project-based mathematical exploration, conjecture
+generation, and theory building.
 
 It supports:
 
-- reading and organizing project notes,
-- refining a research problem,
-- assessing problem quality,
-- searching previous project memory,
-- searching reusable global knowledge,
-- inspecting exact raw session history,
-- trying proof strategies,
-- constructing counterexamples,
-- recording failed paths,
-- checking intermediate claims,
-- verifying final results,
-- resuming the same project later.
+- reading project notes and input files
+- refining candidate problems
+- checking problem quality
+- extracting structural patterns from known problems
+- formulating conjectures and theoretical directions
+- identifying bridges to related methods or domains
+- trying proofs, reductions, examples, and counterexamples
+- recording obstacles and failed paths
+- running verification tools on important claims
+- preserving research progress in project memory
+- retrieving prior project work
+- resuming a project later
 
-Start research mode:
+Start a research shell:
 
 ```bash
 python -m moonshine shell --mode research --project my_research_project
 ```
 
-Autonomous mode is enabled by default in research mode. Limit the number of
-iterations:
+Run with a maximum autonomous iteration count:
 
 ```bash
 python -m moonshine shell --mode research \
@@ -364,7 +499,7 @@ python -m moonshine shell --mode research \
   --max-iterations 50
 ```
 
-Disable autonomous iteration for manual turn-by-turn work:
+Run one turn only:
 
 ```bash
 python -m moonshine shell --mode research \
@@ -372,33 +507,151 @@ python -m moonshine shell --mode research \
   --interactive
 ```
 
-### Suggested Research Prompts
+One-shot research command with a limit:
 
-Start from a topic:
-
-```text
-Explore possible research problems around <topic>. Assess problem quality before solving.
+```bash
+python -m moonshine ask --mode research \
+  --project my_research_project \
+  --max-iterations 20 \
+  "Continue from the current project memory and advance the research."
 ```
 
-Start from a problem:
+Research autopilot stops when it reaches its iteration limit, completes a final
+verified result, detects provider failure, or hits configured safety limits.
 
-```text
-Read workspace/problem.md and continue the research. Search prior project memory first if useful.
+## Sessions
+
+Resume an existing session:
+
+```bash
+python -m moonshine shell --mode research \
+  --project my_research_project \
+  --session session-xxxxxxxxxx
 ```
 
-Continue an existing project:
+Resume a session with one command:
 
-```text
-Continue focused work on the current research progress. Use verification tools for important claims.
+```bash
+python -m moonshine ask --mode research \
+  --project my_research_project \
+  --session session-xxxxxxxxxx \
+  --max-iterations 20 \
+  "Continue the previous session."
 ```
 
-Ask for final review:
+List sessions:
 
-```text
-If the current result is final, call verify_overall with scope="final" and summarize the verified result.
+```bash
+python -m moonshine sessions
 ```
 
-### Research Verification
+Search sessions:
+
+```bash
+python -m moonshine sessions --search "keyword"
+```
+
+Session records include messages, tool events, provider rounds, transcripts,
+context summaries, and compressed provider-round archives.
+
+## Memory and Retrieval
+
+Moonshine has four main retrieval surfaces:
+
+- project research memory
+- raw session history
+- dynamic memory
+- global knowledge
+
+### Project Research Memory
+
+Research mode writes project progress into:
+
+```text
+projects/<project>/memory/research_log.jsonl
+projects/<project>/memory/research_log.md
+projects/<project>/memory/by_type/
+projects/<project>/memory/research_log_index.sqlite
+```
+
+Research-log record types:
+
+```text
+problem
+verified_conclusion
+verification
+final_result
+counterexample
+failed_path
+research_note
+```
+
+Search project memory:
+
+```text
+query_memory(query="phase mismatch lemma")
+```
+
+Search a specific type:
+
+```text
+query_memory(query="phase mismatch lemma", types=["verified_conclusion"])
+```
+
+Search across projects:
+
+```text
+query_memory(query="polynomial reduction", all_projects=true)
+```
+
+### Raw Session History
+
+Use session-record search when exact wording, tool interactions, or source
+locations matter:
+
+```text
+query_session_records(query="failed path", session_id="session-xxxxxxxxxx")
+```
+
+Relevant raw files:
+
+```text
+sessions/<session-id>/messages.jsonl
+sessions/<session-id>/tool_events.jsonl
+sessions/<session-id>/provider_rounds.jsonl
+sessions/<session-id>/transcript.md
+sessions/<session-id>/tool_events/*.json.gz
+sessions/<session-id>/turns/*.json.gz
+sessions/<session-id>/artifacts/context_summaries.jsonl
+```
+
+The unified session index is stored at:
+
+```text
+databases/sessions.sqlite3
+```
+
+### Global Knowledge
+
+Search reusable conclusions:
+
+```text
+search_knowledge(query="commensurate slope polynomial reduction")
+```
+
+Global knowledge files:
+
+```text
+knowledge/KNOWLEDGE.md
+knowledge/conclusions.sqlite3
+knowledge/entries/
+knowledge/vectors/
+```
+
+Verified research conclusions can be stored in global knowledge for reuse
+across projects.
+
+## Verification
 
 Available verification tools:
 
@@ -411,20 +664,36 @@ verify_overall
 ```
 
 Use `assess_problem_quality` before treating a candidate problem as ready for
-serious problem solving.
+serious solving.
 
-Use final verification for final project-level results:
+Use intermediate verification for lemmas, reductions, computations, and partial
+claims.
+
+Use final verification for project-level results:
 
 ```text
 verify_overall(scope="final")
 ```
 
-Use intermediate verification for lemmas, computations, reductions, and partial
-claims.
+`verify_overall` checks assumption use, computation, and logic. The review count
+per dimension is configurable in:
 
-## Working With Files
+```text
+config/settings.json
+```
 
-### Project Files
+```json
+{
+  "agent": {
+    "verification_dimension_review_count": 1
+  }
+}
+```
+
+Verification input is bounded so oversized claims or proofs are trimmed before
+review.
+
+## Files and Paths
 
 Each project lives under:
 
@@ -432,7 +701,7 @@ Each project lives under:
 projects/<project-slug>/
 ```
 
-Common files:
+Common project files:
 
 ```text
 workspace/problem.md
@@ -443,56 +712,10 @@ references/papers/
 references/surveys/
 memory/research_log.jsonl
 memory/research_log.md
-memory/research_log_index.sqlite
 memory/by_type/
 ```
 
-### Input Files
-
-Pass a local file at startup:
-
-```bash
-python -m moonshine shell --mode research \
-  --project my_research_project \
-  --input-file /path/to/source.md
-```
-
-Moonshine stages the file into the runtime home and asks the agent to read it.
-
-You can also place files manually under:
-
-```text
-projects/<project-slug>/references/notes/
-projects/<project-slug>/references/papers/
-projects/<project-slug>/workspace/
-```
-
-### Path Rules
-
-When a project is active, use project-relative paths:
-
-```text
-workspace/problem.md
-memory/research_log.md
-memory/research_log.jsonl
-memory/by_type/verified_conclusion.md
-references/notes/source.md
-```
-
-These legacy paths are also accepted:
-
-```text
-projects/<active-project>/workspace/problem.md
-```
-
-Global runtime paths:
-
-```text
-knowledge/...
-sessions/...
-```
-
-Examples:
+Read runtime files:
 
 ```text
 read_runtime_file(relative_path="workspace/problem.md")
@@ -501,118 +724,22 @@ read_runtime_file(relative_path="knowledge/KNOWLEDGE.md")
 read_runtime_file(relative_path="sessions/<session-id>/messages.jsonl")
 ```
 
-Filesystem MCP tools are project-scoped by default:
+When a project is active, project-relative paths are preferred:
+
+```text
+workspace/problem.md
+memory/research_log.md
+references/notes/source.md
+```
+
+The project filesystem MCP is scoped to the active project by default:
 
 ```text
 mcp_filesystem_read_file(path="workspace/problem.md")
 mcp_filesystem_write_file(path="workspace/notes.md", content="...")
 ```
 
-## Memory and Retrieval
-
-### Project Research Log
-
-Main project log:
-
-```text
-memory/research_log.jsonl
-```
-
-Readable log:
-
-```text
-memory/research_log.md
-```
-
-By-type files:
-
-```text
-memory/by_type/
-```
-
-Search index:
-
-```text
-memory/research_log_index.sqlite
-```
-
-Research log types:
-
-```text
-problem
-verified_conclusion
-verification
-final_result
-counterexample
-failed_path
-research_note
-```
-
-### Search Project Memory
-
-```text
-query_memory(query="phase mismatch lemma")
-```
-
-Search a specific record type:
-
-```text
-query_memory(query="phase mismatch lemma", types=["verified_conclusion"])
-```
-
-Search across projects:
-
-```text
-query_memory(query="polynomial reduction", all_projects=true)
-```
-
-### Search Global Knowledge
-
-```text
-search_knowledge(query="commensurate slope polynomial reduction")
-```
-
-Read the global knowledge index:
-
-```text
-read_runtime_file(relative_path="knowledge/KNOWLEDGE.md")
-```
-
-Read a specific knowledge entry:
-
-```text
-read_runtime_file(relative_path="knowledge/entries/<entry-id>.md")
-```
-
-### Search Raw Session History
-
-Search exact records:
-
-```text
-query_session_records(query="record_failed_path", session_id="session-...")
-```
-
-Common returned paths:
-
-```text
-sessions/<session-id>/messages.jsonl
-sessions/<session-id>/tool_events.jsonl
-sessions/<session-id>/provider_rounds.jsonl
-sessions/<session-id>/context_summaries.jsonl
-sessions/<session-id>/turns/<round-id>.json.gz
-```
-
-Read plain session files:
-
-```text
-read_runtime_file(relative_path="sessions/<session-id>/messages.jsonl")
-read_runtime_file(relative_path="sessions/<session-id>/tool_events.jsonl")
-read_runtime_file(relative_path="sessions/<session-id>/provider_rounds.jsonl")
-```
-
 ## Skills, Tools, Agents, and MCP
-
-Some skill designs in Moonshine were inspired by [Rethlas](https://github.com/frenzymath/Rethlas).
 
 ### Skills
 
@@ -622,25 +749,23 @@ List skills:
 python -m moonshine skills
 ```
 
-Inside shell:
+Shell commands:
 
 ```text
 /skills
 /skills show <skill-slug>
 ```
 
-Skills live under the active runtime home:
+Runtime skill folders:
 
 ```text
-MOONSHINE_HOME/skills/builtin/
-MOONSHINE_HOME/skills/installed/
+skills/builtin/
+skills/installed/
 ```
 
-Each skill is described by a `SKILL.md` file. Moonshine reads the skill metadata,
-description, allowed tools, and `Usage Hint` section from that file so the active
-agent can decide when the skill is relevant. To add a local skill, place a skill
-folder containing `SKILL.md` under `skills/installed/`. To remove a local skill,
-remove that folder or exclude it with exposure config.
+Each skill is defined by a `SKILL.md` file. Moonshine loads the skill metadata,
+description, allowed tools, file references, and `Usage Hint` section for model
+selection.
 
 ### Tools
 
@@ -650,42 +775,57 @@ List tools:
 python -m moonshine tools
 ```
 
-Inside shell:
+Shell commands:
 
 ```text
 /tools
 /tools show <tool-name>
 ```
 
-Tools live under:
+Tool definitions live under:
 
 ```text
-MOONSHINE_HOME/tools/definitions/
-MOONSHINE_HOME/tools/mcp/servers/
+tools/definitions/
 ```
 
-Tool definition files describe the callable tool name, handler, schema, and
-`Usage Hint`. The runtime loads those definitions and exposes matching tool
-schemas to the model. MCP server descriptors live under `tools/mcp/servers/`;
-enabled MCP descriptors can contribute additional tool schemas.
+Each tool definition can include a `Usage Hint` section. The active model sees
+the exposed tool schemas and concise usage guidance.
 
 ### Agents
 
-List or inspect agents:
+List agents:
 
 ```bash
 python -m moonshine agent
+```
+
+Inspect an agent:
+
+```bash
 python -m moonshine agent --show research-control-loop
 ```
 
-Inside shell:
+Run with an explicit agent:
+
+```bash
+python -m moonshine shell --mode research \
+  --project my_research_project \
+  --agent research-control-loop
+```
+
+Runtime agent folders:
 
 ```text
-/agent
-/agent show <agent-slug>
+agents/builtin/
+agents/installed/
 ```
 
 ### MCP
+
+MCP descriptors connect external tools to Moonshine. The built-in filesystem
+descriptor gives project-scoped file access. Tavily adds live web search and
+page extraction, useful for recent references, literature checks, and reading
+web pages during research.
 
 List MCP descriptors:
 
@@ -693,20 +833,24 @@ List MCP descriptors:
 python -m moonshine mcp
 ```
 
-Inspect a descriptor:
+Inspect one descriptor:
 
 ```bash
 python -m moonshine mcp --show filesystem
+python -m moonshine mcp --show tavily
 ```
 
-Configure Tavily:
+Enable Tavily web search:
 
 ```bash
-python -m moonshine mcp --set-tavily-key "tvly-..."
+python -m moonshine mcp --set-tavily-key
 python -m moonshine mcp --enable-tavily
 ```
 
-Inside shell:
+After enabling Tavily, restart Moonshine so the Tavily MCP tools can be
+registered for new sessions.
+
+Shell commands:
 
 ```text
 /mcp
@@ -716,12 +860,32 @@ Inside shell:
 /mcp tavily disable
 ```
 
-### Exposure Config
+## Python Tools
 
-Control which tools and skills are exposed in the runtime config:
+Moonshine includes project-local Python tools for reproducible checks.
+
+Run a Python script inside the active project:
 
 ```text
-MOONSHINE_HOME/config/settings.json
+run_python_script(path="workspace/check.py", args=["--case", "small"])
+```
+
+Install a missing package into the current Moonshine Python environment:
+
+```text
+install_python_package(packages=["sympy"])
+```
+
+The Python runner is bounded by timeout and project path checks. Package
+installation accepts package requirement strings and uses the same Python
+interpreter that runs Moonshine.
+
+## Exposure Config
+
+Control which tools and skills are exposed:
+
+```text
+config/settings.json
 ```
 
 ```json
@@ -740,63 +904,67 @@ Rules:
 - Empty `*_include` means all discovered items of that kind are eligible.
 - Non-empty `*_include` means only those names are eligible.
 - `*_exclude` removes names from the eligible set.
-- Tool names should match callable tool names, such as `query_memory`,
-  `verify_overall`, or `mcp_tavily_tavily_search`.
-- Skill names should match skill slugs, such as `quality-assessor` or
-  `problem-refiner`.
+- Tool names are callable names such as `query_memory` or `verify_overall`.
+- Skill names are skill slugs such as `quality-assessor`.
 
-Example: expose only a small research tool set while hiding one skill:
+Example:
 
 ```json
 {
   "exposure": {
     "tools_include": [
       "query_memory",
+      "query_session_records",
       "read_runtime_file",
       "assess_problem_quality",
       "verify_overall"
     ],
     "tools_exclude": [],
     "skills_include": [],
-    "skills_exclude": [
-      "problem-refiner"
-    ]
+    "skills_exclude": []
   }
 }
 ```
 
-After editing `settings.json`, start a new shell or run a new command so the
-runtime reloads the updated exposure config.
+Start a new command or shell after editing exposure settings.
 
 ## Runtime Layout
 
-Default runtime home:
-
-```text
-~/.moonshine
-```
-
-Typical layout:
+Typical runtime home:
 
 ```text
 MOONSHINE_HOME/
+  AGENTS.md
+  CLAUDE.md
   config/
     settings.json
     credentials.json
+  memory/
+    MEMORY.md
+    audit/events.jsonl
+    feedback/
+    projects/
+    references/
+    user/
   knowledge/
     KNOWLEDGE.md
     conclusions.sqlite3
     entries/
+    vectors/
+  databases/
+    sessions.sqlite3
   sessions/
     <session-id>/
       session.json
       messages.jsonl
       transcript.md
       tool_events.jsonl
-      turn_events.jsonl
       provider_rounds.jsonl
-      context_summaries.jsonl
+      provider_trace.md
+      turn_events.jsonl
+      tool_events/
       turns/
+      artifacts/context_summaries.jsonl
   agents/
   skills/
   tools/
@@ -809,19 +977,47 @@ MOONSHINE_HOME/
       memory/
 ```
 
+## Latest Updates
+
+### 2026-06
+
+- Added OpenAI Responses provider support.
+- Added reasoning effort and reasoning summary configuration.
+- Added dedicated archival provider configuration.
+- Added archival fallback to the main provider.
+- Added structured-output support for Responses-based verification and archival.
+- Added project-local Python script execution.
+- Added Python package installation for project scripts.
+- Improved compatibility for assistant `reasoning_content` in session history.
+- Improved session continuation with reasoning and visible assistant content.
+
+### 2026-05
+
+- Added typed project research logs.
+- Added `research_log.jsonl`, readable `research_log.md`, by-type Markdown files,
+  and `research_log_index.sqlite`.
+- Added unified session-record retrieval.
+- Added indexed tool-event retrieval.
+- Added recovery references for large archived tool payloads.
+- Added query-time backfill for older session files.
+- Added `query_session_records` for exact raw session recovery.
+- Added exposure controls for skills and tools.
+- Added Usage Hint loading from skill and tool Markdown files.
+- Added Tavily MCP setup commands.
+- Improved research-mode provider failure handling.
+
 ## Testing
 
-Run all architecture tests:
+Run the main test suite from the repository root:
 
 ```bash
-cd moonshine
-python -m unittest moonshine.tests.test_architecture
+python -m unittest discover -s moonshine/tests -t . -p "test_architecture.py"
 ```
 
-Run one targeted test:
+Run all tests:
 
 ```bash
-python -m unittest moonshine.tests.test_architecture.MoonshineArchitectureTestCase.test_mcp_filesystem_normalizes_legacy_project_prefix_for_writes
+python -m unittest discover -s moonshine/tests -t .
 ```
 
 ## Troubleshooting
@@ -838,7 +1034,7 @@ List sessions:
 python -m moonshine sessions
 ```
 
-Search session text:
+Search sessions:
 
 ```bash
 python -m moonshine sessions --search "keyword"
@@ -850,20 +1046,41 @@ List tools:
 python -m moonshine tools
 ```
 
+List skills:
+
+```bash
+python -m moonshine skills
+```
+
 List MCP descriptors:
 
 ```bash
 python -m moonshine mcp
 ```
 
-Check dependency imports:
+Check dependencies:
 
 ```bash
 python -m moonshine init --check-deps
 ```
 
+If a provider call fails, run:
+
+```bash
+python -m moonshine provider --show
+```
+
+Then check:
+
+- provider type
+- model name
+- base URL or Azure endpoint
+- API key environment name
+- whether the key was stored with `--set-api-key`
+- whether the model supports the configured reasoning or structured-output mode
+
 ## Status
 
-Moonshine is experimental. It is intended for local, inspectable, project-based
-agent workflows for mathematical research, long-running problem solving, and
-reusable research memory.
+Moonshine is experimental software for local, inspectable, project-based agent
+workflows in autonomous mathematical research, conjecture generation, and
+long-running theory exploration.
