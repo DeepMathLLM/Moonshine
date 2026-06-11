@@ -35,7 +35,6 @@ packages = [
     "moonshine.moonshine_cli",
     "moonshine.skills",
     "moonshine.storage",
-    "moonshine.tests",
     "moonshine.tools",
 ]
 include-package-data = true

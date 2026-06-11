@@ -9,7 +9,6 @@ PACKAGES = [
     "moonshine.moonshine_cli",
     "moonshine.skills",
     "moonshine.storage",
-    "moonshine.tests",
     "moonshine.tools",
 ]
 

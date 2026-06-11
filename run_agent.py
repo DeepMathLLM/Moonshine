@@ -92,13 +92,14 @@ class AIAgent(object):
     """Moonshine conversation runner."""
 
     OFFLINE_RESPONSE_PREFIX = "Moonshine processed the request in offline mode."
-    OFFLINE_FINAL_REASONS = {"provider_offline", "verification_provider_offline"}
+    OFFLINE_FINAL_REASONS = {"provider_offline", "verification_provider_offline", "archival_provider_offline"}
 
-    def __init__(self, *, config, paths, provider, verification_provider, memory_manager, session_store, agent_manager, skill_manager, tool_manager, context_manager):
+    def __init__(self, *, config, paths, provider, verification_provider, archival_provider, memory_manager, session_store, agent_manager, skill_manager, tool_manager, context_manager):
         self.config = config
         self.paths = paths
         self.provider = provider
         self.verification_provider = verification_provider
+        self.archival_provider = archival_provider
         self.memory_manager = memory_manager
         self.session_store = session_store
         self.agent_manager = agent_manager
@@ -109,7 +110,7 @@ class AIAgent(object):
         self.context_manager = context_manager
         self.research_workflow = ResearchWorkflowManager(
             paths=paths,
-            provider=provider,
+            provider=archival_provider,
             memory_manager=memory_manager,
             session_store=session_store,
             config=config,
@@ -152,6 +153,39 @@ class AIAgent(object):
                 return error
         return ""
 
+    def _archive_provider_failed(self, payload: Dict[str, object]) -> bool:
+        """Return whether an archival attempt failed because its provider path is unusable."""
+        if not payload:
+            return True
+        if payload.get("error"):
+            return True
+        skipped = str(payload.get("skipped") or "").strip().lower()
+        return skipped == "structured_provider_unavailable"
+
+    def _archive_after_turn_with_provider(
+        self,
+        provider,
+        *,
+        project_slug: str,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        turn_context: Sequence[Dict[str, object]],
+    ) -> Dict[str, object]:
+        """Run the research archival pass with a specific provider instance."""
+        previous_provider = self.research_workflow.provider
+        self.research_workflow.provider = provider
+        try:
+            return self.research_workflow.archive_after_turn(
+                project_slug=project_slug,
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                turn_context=list(turn_context),
+            )
+        finally:
+            self.research_workflow.provider = previous_provider
+
     def _build_runtime(self, *, mode: str, project_slug: str, session_id: str, agent_slug: str = "") -> Dict[str, object]:
         """Build the tool runtime mapping."""
         resolved_agent_slug = str(agent_slug or self._default_agent_slug_for_mode(mode)).strip()
@@ -169,8 +203,12 @@ class AIAgent(object):
             "research_workflow": self.research_workflow,
             "provider": self.provider,
             "verification_provider": self.verification_provider,
+            "archival_provider": self.archival_provider,
             "verification_provider_inherit_from_main": bool(
                 getattr(self.config.verification_provider, "inherit_from_main", True)
+            ),
+            "archival_provider_inherit_from_main": bool(
+                getattr(self.config.archival_provider, "inherit_from_main", True)
             ),
             "mode": mode,
             "project_slug": project_slug,
@@ -551,7 +589,7 @@ class AIAgent(object):
                 for item in prepared_calls
             ],
         }
-        if reasoning_content:
+        if str(reasoning_content or "").strip():
             message["reasoning_content"] = reasoning_content
         return message
 
@@ -672,8 +710,10 @@ class AIAgent(object):
             or str(cleaned.get("exact_excerpt") or "")
             or str(cleaned.get("summary") or "")
             or str(cleaned.get("window_excerpt") or "")
+            or str(cleaned.get("local_context") or "")
+            or str(cleaned.get("content") or "")
         )
-        for key in ["content", "text", "summary", "window_excerpt", "content_inline", "exact_excerpt"]:
+        for key in ["local_context", "content", "text", "summary", "window_excerpt", "content_inline", "exact_excerpt"]:
             if key in cleaned and isinstance(cleaned.get(key), str):
                 remaining = max(32, token_budget - self._estimate_query_memory_visible_tokens({k: v for k, v in cleaned.items() if k != key}))
                 cleaned[key] = self._trim_query_memory_text(
@@ -703,7 +743,7 @@ class AIAgent(object):
             for key, value in cleaned.items()
             if key in {"id", "key", "source", "source_type", "type", "artifact_type", "title", "content_path", "project_slug", "session_id", "created_at", "score", "source_refs"}
         }
-        text = str(cleaned.get("content") or cleaned.get("text") or cleaned.get("summary") or "")
+        text = str(cleaned.get("content") or cleaned.get("local_context") or cleaned.get("text") or cleaned.get("summary") or "")
         if text:
             minimal["content"] = self._trim_query_memory_text(text, query=query, anchor=anchor, token_budget=max(32, token_budget - 128))
         return minimal
@@ -783,6 +823,7 @@ class AIAgent(object):
         compact: Dict[str, object] = {}
         scalar_keys = [
             "query",
+            "scope",
             "project_scope",
             "all_projects",
             "types",
@@ -791,6 +832,7 @@ class AIAgent(object):
             "limit_per_channel",
             "prefer_raw",
             "summary",
+            "raw_record_locations",
         ]
         for key in scalar_keys:
             if key in output:
@@ -806,6 +848,16 @@ class AIAgent(object):
 
         used_budget = self._estimate_query_memory_visible_tokens(compact)
         remaining_budget = max(0, QUERY_MEMORY_VISIBLE_TOKEN_BUDGET - used_budget)
+        if isinstance(output.get("results"), list) and remaining_budget > 0:
+            used = self._append_query_memory_collection_with_budget(
+                compact,
+                "results",
+                list(output.get("results") or []),
+                query=query,
+                budget_tokens=remaining_budget,
+            )
+            remaining_budget = max(0, remaining_budget - used)
+
         if isinstance(output.get("compressed_windows"), list) and remaining_budget > 0:
             used = self._append_query_memory_collection_with_budget(
                 compact,
@@ -824,6 +876,7 @@ class AIAgent(object):
             "dynamic_hits",
             "session_hits",
             "event_hits",
+            "tool_event_hits",
             "knowledge_hits",
             "graph_hits",
         ]
@@ -1031,7 +1084,7 @@ class AIAgent(object):
             messages=state.provider_messages,
             tool_schemas=state.tool_schemas,
         ):
-            if provider_event.type == "reasoning_delta" and provider_event.text:
+            if provider_event.type == "reasoning_delta" and str(provider_event.text or "").strip():
                 yield AgentEvent(
                     type="reasoning_delta",
                     text=provider_event.text,
@@ -1116,7 +1169,7 @@ class AIAgent(object):
             messages=finalization_messages,
             tool_schemas=[],
         ):
-            if provider_event.type == "reasoning_delta" and provider_event.text:
+            if provider_event.type == "reasoning_delta" and str(provider_event.text or "").strip():
                 yield AgentEvent(
                     type="reasoning_delta",
                     text=provider_event.text,
@@ -1156,7 +1209,7 @@ class AIAgent(object):
         )
         self.context_manager.provider = self.provider
         self.memory_manager.set_provider(self.provider)
-        self.research_workflow.provider = self.provider
+        self.research_workflow.provider = self.archival_provider
         resolved_agent_slug = str(agent_slug or self._default_agent_slug_for_mode(mode)).strip()
         active_agent = self.agent_manager.get_agent(resolved_agent_slug)
         if active_agent is None:
@@ -1412,7 +1465,7 @@ class AIAgent(object):
                 if round_text:
                     state.fallback_response_text = round_text
                     state.fallback_response_streamed = round_streamed
-                    state.fallback_response_reasoning_content = response.reasoning_content
+                    state.fallback_response_reasoning_content = response.reasoning_content if str(response.reasoning_content or "").strip() else ""
 
                 prepared_calls, invalid_batch = self._prepare_tool_calls(state, response.tool_calls)
                 repaired_calls = [item for item in prepared_calls if item.repaired_from]
@@ -1435,7 +1488,7 @@ class AIAgent(object):
                     {
                         "kind": "assistant_tool_calls",
                         "content": response.content,
-                        "reasoning_content": response.reasoning_content,
+                        "reasoning_content": response.reasoning_content if str(response.reasoning_content or "").strip() else "",
                         "tool_calls": [
                             {
                                 "call_id": item.call_id,
@@ -1570,13 +1623,13 @@ class AIAgent(object):
             if round_text:
                 state.final_text = round_text
                 state.final_reason = "assistant_text"
-                state.final_reasoning_content = response.reasoning_content
+                state.final_reasoning_content = response.reasoning_content if str(response.reasoning_content or "").strip() else ""
                 self._append_turn_transcript(
                     state,
                     {
                         "kind": "assistant_output",
                         "content": round_text,
-                        "reasoning_content": response.reasoning_content,
+                        "reasoning_content": state.final_reasoning_content,
                         "model_round": state.model_round,
                     },
                 )
@@ -1632,7 +1685,7 @@ class AIAgent(object):
             if state.fallback_response_text:
                 state.final_text = state.fallback_response_text
                 state.final_reason = "fallback_content_with_tools"
-                state.final_reasoning_content = state.fallback_response_reasoning_content
+                state.final_reasoning_content = state.fallback_response_reasoning_content if str(state.fallback_response_reasoning_content or "").strip() else ""
                 final_already_streamed = state.fallback_response_streamed
                 break
 
@@ -1653,13 +1706,14 @@ class AIAgent(object):
                 if final_text:
                     state.final_text = final_text
                     state.final_reason = state.final_reason or "finalization_pass"
-                    state.final_reasoning_content = self._normalize_text(final_response.reasoning_content)
+                    normalized_reasoning = self._normalize_text(final_response.reasoning_content)
+                    state.final_reasoning_content = normalized_reasoning if normalized_reasoning.strip() else ""
                     self._append_turn_transcript(
                         state,
                                     {
                                         "kind": "assistant_output",
                                         "content": final_text,
-                                        "reasoning_content": self._normalize_text(final_response.reasoning_content),
+                                        "reasoning_content": state.final_reasoning_content,
                                         "source": "finalization_pass",
                                         "model_round": state.model_round,
                                     },
@@ -1683,13 +1737,14 @@ class AIAgent(object):
                             if final_text:
                                 state.final_text = final_text
                                 state.final_reason = state.final_reason or "finalization_pass"
-                                state.final_reasoning_content = self._normalize_text(final_response.reasoning_content)
+                                normalized_reasoning = self._normalize_text(final_response.reasoning_content)
+                                state.final_reasoning_content = normalized_reasoning if normalized_reasoning.strip() else ""
                                 self._append_turn_transcript(
                                     state,
                                     {
                                         "kind": "assistant_output",
                                         "content": final_text,
-                                        "reasoning_content": self._normalize_text(final_response.reasoning_content),
+                                        "reasoning_content": state.final_reasoning_content,
                                         "source": "finalization_pass_retry",
                                         "model_round": state.model_round,
                                     },
@@ -1708,7 +1763,7 @@ class AIAgent(object):
                 if exc is not None and state.fallback_response_text:
                     state.final_text = state.fallback_response_text
                     state.final_reason = state.final_reason or "fallback_content_with_tools"
-                    state.final_reasoning_content = state.fallback_response_reasoning_content
+                    state.final_reasoning_content = state.fallback_response_reasoning_content if str(state.fallback_response_reasoning_content or "").strip() else ""
                     final_already_streamed = state.fallback_response_streamed
 
         if not state.final_text:
@@ -1733,7 +1788,7 @@ class AIAgent(object):
             "final_reason": state.final_reason,
             "summary_pass_used": state.summary_pass_used,
         }
-        if state.final_reasoning_content:
+        if str(state.final_reasoning_content or "").strip():
             assistant_metadata["reasoning_content"] = state.final_reasoning_content
         self.session_store.append_message(
             state.session_id,
@@ -1765,27 +1820,53 @@ class AIAgent(object):
                 )
                 if status_event is not None:
                     yield status_event
-                archive_payload = self.research_workflow.archive_after_turn(
+                archive_payload = self._archive_after_turn_with_provider(
+                    self.archival_provider,
                     project_slug=state.project_slug,
                     session_id=state.session_id,
                     user_message=user_message,
                     assistant_message=state.final_text,
                     turn_context=list(state.turn_transcript),
                 )
-                research_workflow_update = {"research_log_archive": archive_payload}
-                status_event = self._emit_status(
-                    state,
-                    "Project research memory updated: %s record(s)."
-                    % int(archive_payload.get("archived") or 0),
-                    research_workflow=research_workflow_update,
-                )
-                if status_event is not None:
-                    yield status_event
                 archive_status = dict(archive_payload or {})
-                if archive_status.get("error"):
+                archival_inherits_main = bool(getattr(self.config.archival_provider, "inherit_from_main", True))
+                if (
+                    self._archive_provider_failed(archive_status)
+                    and not archival_inherits_main
+                    and self.archival_provider is not self.provider
+                ):
                     status_event = self._emit_status(
                         state,
-                        "Project research memory update failed: %s" % str(archive_status.get("error")),
+                        "Dedicated archival provider failed; retrying research memory update with the main provider.",
+                        phase="research_archive",
+                        research_log_archive=archive_status,
+                    )
+                    if status_event is not None:
+                        yield status_event
+                    fallback_payload = self._archive_after_turn_with_provider(
+                        self.provider,
+                        project_slug=state.project_slug,
+                        session_id=state.session_id,
+                        user_message=user_message,
+                        assistant_message=state.final_text,
+                        turn_context=list(state.turn_transcript),
+                    )
+                    fallback_payload = dict(fallback_payload or {})
+                    fallback_payload["fallback_provider"] = "main"
+                    fallback_payload["primary_archival_error"] = {
+                        key: value
+                        for key, value in archive_status.items()
+                        if key in {"error", "skipped", "archived"}
+                    }
+                    archive_payload = fallback_payload
+                    archive_status = dict(archive_payload or {})
+                research_workflow_update = {"research_log_archive": archive_payload}
+                if self._archive_provider_failed(archive_status):
+                    state.final_reason = "archival_provider_offline"
+                    status_event = self._emit_status(
+                        state,
+                        "Research autopilot stopped because the archival provider is offline or unavailable: %s"
+                        % str(archive_status.get("error") or archive_status.get("skipped") or "unknown archival provider failure"),
                         phase="research_archive",
                         research_log_archive=archive_status,
                     )
@@ -1800,7 +1881,29 @@ class AIAgent(object):
                     )
                     if status_event is not None:
                         yield status_event
+                else:
+                    status_text = (
+                        "Project research memory updated with main-provider fallback: %s record(s)."
+                        if archive_status.get("fallback_provider") == "main"
+                        else "Project research memory updated: %s record(s)."
+                    )
+                    status_event = self._emit_status(
+                        state,
+                        status_text % int(archive_payload.get("archived") or 0),
+                        research_workflow=research_workflow_update,
+                    )
+                    if status_event is not None:
+                        yield status_event
             except Exception as exc:
+                state.final_reason = "archival_provider_offline"
+                status_event = self._emit_status(
+                    state,
+                    "Research autopilot stopped because the archival provider failed: %s" % str(exc),
+                    phase="research_archive",
+                    research_log_archive={"archived": 0, "error": str(exc)},
+                )
+                if status_event is not None:
+                    yield status_event
                 self._record_turn_event(
                     state.session_id,
                     "research_workflow_error",
@@ -1935,7 +2038,7 @@ def render_agent_events(events: Iterable[AgentEvent]) -> str:
         elif event.type == "tool_error":
             close_streamed_block()
             print("[tool-error] %s %s" % (event.text, event.payload.get("error", "unknown tool error")))
-        elif event.type == "reasoning_delta":
+        elif event.type == "reasoning_delta" and str(event.text or "").strip():
             if emitted_text:
                 print()
                 emitted_text = False

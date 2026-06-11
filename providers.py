@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
 from moonshine.agent_runtime.model_metadata import DEFAULT_CONTEXT_WINDOW_TOKENS
-from moonshine.json_schema import validate_json_schema
+from moonshine.json_schema import JsonSchemaValidationError, validate_json_schema
 
 try:
     from urllib.error import HTTPError, URLError
@@ -66,6 +66,29 @@ def _coerce_structured_payload(parsed: Any, response_schema: Dict[str, object]) 
     return dict(parsed)
 
 
+def _parse_json_object_from_text(text: str) -> Dict[str, object]:
+    """Parse a JSON object, accepting simple prose/fence wrappers as fallback."""
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except ValueError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(cleaned[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("structured provider response must be a JSON object")
+    return dict(parsed)
+
+
 class BaseProvider(object, metaclass=ABCMeta):
     """Abstract response provider."""
 
@@ -93,7 +116,7 @@ class BaseProvider(object, metaclass=ABCMeta):
             messages=messages,
             tool_schemas=tool_schemas,
         )
-        if response.reasoning_content:
+        if str(response.reasoning_content or "").strip():
             yield ProviderStreamEvent(type="reasoning_delta", text=response.reasoning_content, raw_payload=response.raw_payload)
         if response.content:
             yield ProviderStreamEvent(type="text_delta", text=response.content, raw_payload=response.raw_payload)
@@ -283,6 +306,7 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         api_key_env: str,
         timeout_seconds: int,
         temperature: float,
+        reasoning_effort: str = "",
         stream: bool = True,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
@@ -293,6 +317,7 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         self.api_key_env = api_key_env
         self.timeout_seconds = timeout_seconds
         self.temperature = temperature
+        self.reasoning_effort = str(reasoning_effort or "").strip()
         self.stream = stream
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
@@ -318,6 +343,8 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if tool_schemas:
             payload["tools"] = [{"type": "function", "function": schema} for schema in tool_schemas]
         if response_format:
@@ -538,7 +565,7 @@ class OpenAIChatCompletionsProvider(BaseProvider):
                             builder.add_content(content)
                             yield ProviderStreamEvent(type="text_delta", text=content, raw_payload=parsed)
                         reasoning_content = delta.get("reasoning_content") or ""
-                        if isinstance(reasoning_content, str) and reasoning_content:
+                        if isinstance(reasoning_content, str) and reasoning_content.strip():
                             builder.add_reasoning(reasoning_content)
                             yield ProviderStreamEvent(type="reasoning_delta", text=reasoning_content, raw_payload=parsed)
                         for tool_item in delta.get("tool_calls") or []:
@@ -634,6 +661,7 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
         api_version: str,
         timeout_seconds: int,
         temperature: Optional[float],
+        reasoning_effort: str = "",
         stream: bool = True,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
@@ -645,6 +673,7 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
             api_key_env=api_key_env,
             timeout_seconds=timeout_seconds,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
             stream=stream,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -804,20 +833,530 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
         )
 
 
-class OpenAIResponsesProvider(BaseProvider):
-    """Placeholder OpenAI responses provider."""
+class _OpenAIResponsesStreamBuilder(object):
+    """Accumulate OpenAI Responses API streaming events."""
 
-    def __init__(self, model: str, base_url: str, api_key_env: str):
+    def __init__(self):
+        self.content_parts: List[str] = []
+        self.reasoning_parts: List[str] = []
+        self.tool_call_parts: Dict[str, Dict[str, str]] = {}
+        self.completed_response: Dict[str, object] = {}
+
+    def add_content(self, text: str) -> None:
+        if text:
+            self.content_parts.append(text)
+
+    def add_reasoning(self, text: str) -> None:
+        if text:
+            self.reasoning_parts.append(text)
+
+    def _tool_key(self, data: Dict[str, object], item: Optional[Dict[str, object]] = None) -> str:
+        item = dict(item or {})
+        return str(item.get("id") or data.get("item_id") or data.get("output_index") or len(self.tool_call_parts))
+
+    def add_tool_item(self, data: Dict[str, object], item: Dict[str, object]) -> None:
+        if str(item.get("type") or "") != "function_call":
+            return
+        key = self._tool_key(data, item)
+        state = self.tool_call_parts.setdefault(key, {"name": "", "arguments": "", "call_id": ""})
+        if item.get("name"):
+            state["name"] = str(item.get("name") or "")
+        if item.get("arguments") is not None:
+            state["arguments"] = str(item.get("arguments") or "")
+        if item.get("call_id") or item.get("id"):
+            state["call_id"] = str(item.get("call_id") or item.get("id") or "")
+
+    def add_tool_arguments_delta(self, data: Dict[str, object]) -> None:
+        key = self._tool_key(data)
+        state = self.tool_call_parts.setdefault(key, {"name": "", "arguments": "", "call_id": ""})
+        if data.get("delta"):
+            state["arguments"] += str(data.get("delta") or "")
+
+    def add_tool_arguments_done(self, data: Dict[str, object]) -> None:
+        key = self._tool_key(data)
+        state = self.tool_call_parts.setdefault(key, {"name": "", "arguments": "", "call_id": ""})
+        if data.get("arguments") is not None:
+            state["arguments"] = str(data.get("arguments") or "")
+
+    def to_response(self) -> ProviderResponse:
+        if self.completed_response:
+            response = OpenAIResponsesProvider._response_from_payload_static(self.completed_response)
+            if not response.content and self.content_parts:
+                response.content = "".join(self.content_parts)
+            if not response.reasoning_content and self.reasoning_parts:
+                response.reasoning_content = "".join(self.reasoning_parts)
+            if not response.tool_calls and self.tool_call_parts:
+                response.tool_calls = self._tool_calls()
+            return response
+        return ProviderResponse(
+            content="".join(self.content_parts),
+            reasoning_content="".join(self.reasoning_parts),
+            tool_calls=self._tool_calls(),
+            raw_payload={"streamed": True},
+        )
+
+    def _tool_calls(self) -> List[ProviderToolCall]:
+        calls = []
+        for key in sorted(self.tool_call_parts):
+            item = self.tool_call_parts[key]
+            if not item.get("name"):
+                continue
+            calls.append(
+                ProviderToolCall(
+                    name=item.get("name", ""),
+                    arguments=_safe_parse_tool_arguments(item.get("arguments", "")),
+                    call_id=item.get("call_id", "") or key,
+                )
+            )
+        return calls
+
+
+class OpenAIResponsesProvider(BaseProvider):
+    """OpenAI-compatible Responses API provider."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key_env: str,
+        timeout_seconds: int = 600,
+        temperature: Optional[float] = None,
+        reasoning_effort: str = "",
+        reasoning_summary: str = "",
+        structured_output_format: str = "json_schema",
+        stream: bool = True,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
+        max_context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+    ):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key_env = api_key_env
+        self.timeout_seconds = timeout_seconds
+        self.temperature = temperature
+        self.reasoning_effort = str(reasoning_effort or "").strip()
+        self.reasoning_summary = str(reasoning_summary or "").strip()
+        self.structured_output_format = str(structured_output_format or "json_schema").strip().lower()
+        self.stream = bool(stream)
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+        self.max_context_tokens = max(1024, int(max_context_tokens))
+
+    def _fallback(self, note: str) -> OfflineProvider:
+        return OfflineProvider(note=note)
+
+    def _message_content_text(self, item: Dict[str, object]) -> str:
+        content = str(item.get("content") or "")
+        reasoning_content = str(item.get("reasoning_content") or "").strip()
+        if reasoning_content:
+            return "[reasoning]\n%s\n[/reasoning]\n\n%s" % (reasoning_content, content)
+        return content
+
+    def _responses_input(self, messages: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        items: List[Dict[str, object]] = []
+        for raw in messages or []:
+            item = dict(raw or {})
+            role = str(item.get("role") or "user")
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(item.get("tool_call_id") or item.get("name") or ""),
+                        "output": str(item.get("content") or ""),
+                    }
+                )
+                continue
+            if role in {"user", "assistant", "system", "developer"}:
+                text = self._message_content_text(item)
+                if text:
+                    normalized_role = "user" if role in {"system", "developer"} else role
+                    items.append({"role": normalized_role, "content": text})
+                for tool_call in list(item.get("tool_calls") or []):
+                    tool_call = dict(tool_call or {})
+                    function = dict(tool_call.get("function") or {})
+                    name = str(function.get("name") or "")
+                    if not name:
+                        continue
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(tool_call.get("id") or ""),
+                            "name": name,
+                            "arguments": str(function.get("arguments") or "{}"),
+                        }
+                    )
+                continue
+            text = self._message_content_text(item)
+            if text:
+                items.append({"role": "user", "content": text})
+        return items
+
+    def _responses_tools(self, tool_schemas: Optional[List[Dict[str, object]]]) -> List[Dict[str, object]]:
+        tools = []
+        for schema in list(tool_schemas or []):
+            if not isinstance(schema, dict):
+                continue
+            name = str(schema.get("name") or "").strip()
+            if not name:
+                continue
+            tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": str(schema.get("description") or ""),
+                    "parameters": dict(schema.get("parameters") or {"type": "object", "properties": {}}),
+                }
+            )
+        return tools
+
+    def _build_payload(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[Dict[str, object]],
+        tool_schemas: Optional[List[Dict[str, object]]] = None,
+        stream: bool = False,
+        text_format: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "model": self.model,
+            "instructions": system_prompt,
+            "input": self._responses_input(messages),
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        reasoning: Dict[str, object] = {}
+        if self.reasoning_effort:
+            reasoning["effort"] = self.reasoning_effort
+        if self.reasoning_summary:
+            reasoning["summary"] = self.reasoning_summary
+        if reasoning:
+            payload["reasoning"] = reasoning
+        tools = self._responses_tools(tool_schemas)
+        if tools:
+            payload["tools"] = tools
+        if text_format:
+            payload["text"] = {"format": text_format}
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def _json_schema_text_format(self, *, schema_name: str, response_schema: Dict[str, object]) -> Dict[str, object]:
+        return {
+            "type": "json_schema",
+            "name": schema_name,
+            "schema": response_schema,
+            "strict": True,
+        }
+
+    def _json_object_text_format(self) -> Dict[str, object]:
+        return {"type": "json_object"}
+
+    def _initial_structured_text_format(self, *, schema_name: str, response_schema: Dict[str, object]) -> Optional[Dict[str, object]]:
+        mode = self.structured_output_format
+        if mode in {"auto", "json_schema"}:
+            return self._json_schema_text_format(schema_name=schema_name, response_schema=response_schema)
+        if mode == "json_object":
+            return self._json_object_text_format()
+        if mode == "prompt":
+            return None
+        return self._json_schema_text_format(schema_name=schema_name, response_schema=response_schema)
+
+    def _should_retry_with_json_object_text_format(self, exc: Exception) -> bool:
+        lowered = _format_provider_exception(exc).lower()
+        return (
+            "text.format" in lowered
+            or "response_format" in lowered
+            or "json_schema" in lowered
+            or "schema" in lowered
+            or "strict" in lowered
+            or "unknown parameter" in lowered
+            or "invalid_request" in lowered
+            or "unavailable" in lowered
+            or "unsupported" in lowered
+        )
+
+    def _should_retry_without_text_format(self, exc: Exception) -> bool:
+        lowered = _format_provider_exception(exc).lower()
+        return (
+            "text.format" in lowered
+            or "json_object" in lowered
+            or "response_format" in lowered
+            or "unknown parameter" in lowered
+            or "invalid_request" in lowered
+            or "unavailable" in lowered
+            or "unsupported" in lowered
+        )
+
+    def _make_request(self, payload: Dict[str, object], api_key: str) -> Request:
+        return Request(
+            self.base_url + "/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % api_key,
+            },
+            method="POST",
+        )
+
+    @staticmethod
+    def _response_from_payload_static(parsed: Dict[str, object]) -> ProviderResponse:
+        output_text = str(parsed.get("output_text") or "")
+        content_parts: List[str] = [output_text] if output_text else []
+        reasoning_parts: List[str] = []
+        tool_calls: List[ProviderToolCall] = []
+        for item in list(parsed.get("output") or []):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "message":
+                for content_item in list(item.get("content") or []):
+                    if not isinstance(content_item, dict):
+                        continue
+                    content_type = str(content_item.get("type") or "")
+                    if content_type in {"output_text", "text", "input_text"} and content_item.get("text"):
+                        text = str(content_item.get("text") or "")
+                        if text and text not in content_parts:
+                            content_parts.append(text)
+            elif item_type == "function_call":
+                tool_calls.append(
+                    ProviderToolCall(
+                        name=str(item.get("name") or ""),
+                        arguments=_safe_parse_tool_arguments(str(item.get("arguments") or "{}")),
+                        call_id=str(item.get("call_id") or item.get("id") or ""),
+                    )
+                )
+            elif item_type == "reasoning":
+                for summary_item in list(item.get("summary") or item.get("content") or []):
+                    if isinstance(summary_item, dict) and summary_item.get("text"):
+                        reasoning_parts.append(str(summary_item.get("text") or ""))
+                    elif isinstance(summary_item, str):
+                        reasoning_parts.append(summary_item)
+                if item.get("text"):
+                    reasoning_parts.append(str(item.get("text") or ""))
+        return ProviderResponse(
+            content="".join(content_parts),
+            reasoning_content="".join(reasoning_parts),
+            tool_calls=tool_calls,
+            raw_payload=parsed,
+        )
+
+    def _response_from_payload(self, parsed: Dict[str, object]) -> ProviderResponse:
+        return self._response_from_payload_static(parsed)
 
     def generate(self, *, system_prompt: str, messages: List[Dict[str, str]], tool_schemas: Optional[List[Dict[str, object]]] = None) -> ProviderResponse:
-        return OfflineProvider(note="responses mode is scaffolded but not enabled in the offline test profile").generate(
+        api_key = os.environ.get(self.api_key_env)
+        if not api_key:
+            return self._fallback("missing API key environment variable %s" % self.api_key_env).generate(
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_schemas=tool_schemas,
+            )
+        if Request is None or urlopen is None:
+            return self._fallback("urllib request support is unavailable").generate(
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_schemas=tool_schemas,
+            )
+        payload = self._build_payload(system_prompt=system_prompt, messages=messages, tool_schemas=tool_schemas)
+        last_exc = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                request = self._make_request(payload, api_key)
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+                return self._response_from_payload(parsed)
+            except (HTTPError, URLError, KeyError, IndexError, ValueError) as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_seconds * float(attempt + 1))
+                    continue
+        return self._fallback("responses call failed: %s" % _format_provider_exception(last_exc)).generate(
             system_prompt=system_prompt,
             messages=messages,
             tool_schemas=tool_schemas,
         )
+
+    def _iter_sse_events(self, response) -> Iterator[Dict[str, object]]:
+        event_type = ""
+        data_lines: List[str] = []
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if data_lines:
+                    data_text = "\n".join(data_lines).strip()
+                    if data_text and data_text != "[DONE]":
+                        try:
+                            parsed = json.loads(data_text)
+                            if event_type and not parsed.get("type"):
+                                parsed["type"] = event_type
+                            yield parsed
+                        except ValueError:
+                            pass
+                event_type = ""
+                data_lines = []
+                continue
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if data_lines:
+            data_text = "\n".join(data_lines).strip()
+            if data_text and data_text != "[DONE]":
+                try:
+                    parsed = json.loads(data_text)
+                    if event_type and not parsed.get("type"):
+                        parsed["type"] = event_type
+                    yield parsed
+                except ValueError:
+                    pass
+
+    def stream_generate(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[Dict[str, str]],
+        tool_schemas: Optional[List[Dict[str, object]]] = None,
+    ) -> Iterator[ProviderStreamEvent]:
+        if not self.stream:
+            yield from super().stream_generate(system_prompt=system_prompt, messages=messages, tool_schemas=tool_schemas)
+            return
+        api_key = os.environ.get(self.api_key_env)
+        if not api_key:
+            yield from self._fallback("missing API key environment variable %s" % self.api_key_env).stream_generate(
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_schemas=tool_schemas,
+            )
+            return
+        if Request is None or urlopen is None:
+            yield from self._fallback("urllib request support is unavailable").stream_generate(
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_schemas=tool_schemas,
+            )
+            return
+        payload = self._build_payload(system_prompt=system_prompt, messages=messages, tool_schemas=tool_schemas, stream=True)
+        last_exc = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                request = self._make_request(payload, api_key)
+                builder = _OpenAIResponsesStreamBuilder()
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    for parsed in self._iter_sse_events(response):
+                        event_type = str(parsed.get("type") or "")
+                        if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+                            delta = str(parsed.get("delta") or "")
+                            if delta.strip():
+                                builder.add_reasoning(delta)
+                                yield ProviderStreamEvent(type="reasoning_delta", text=delta, raw_payload=parsed)
+                        elif event_type == "response.output_text.delta":
+                            delta = str(parsed.get("delta") or "")
+                            if delta:
+                                builder.add_content(delta)
+                                yield ProviderStreamEvent(type="text_delta", text=delta, raw_payload=parsed)
+                        elif event_type in {"response.output_item.added", "response.output_item.done"}:
+                            item = parsed.get("item") or parsed.get("output_item") or {}
+                            if isinstance(item, dict):
+                                builder.add_tool_item(parsed, item)
+                        elif event_type == "response.function_call_arguments.delta":
+                            builder.add_tool_arguments_delta(parsed)
+                        elif event_type == "response.function_call_arguments.done":
+                            builder.add_tool_arguments_done(parsed)
+                        elif event_type in {"response.completed", "response.done"}:
+                            response_payload = parsed.get("response") or parsed
+                            if isinstance(response_payload, dict):
+                                builder.completed_response = dict(response_payload)
+                        elif event_type in {"response.failed", "error"}:
+                            raise RuntimeError(json.dumps(parsed, ensure_ascii=False))
+                response_payload = builder.to_response()
+                yield ProviderStreamEvent(type="response", response=response_payload, raw_payload=response_payload.raw_payload)
+                return
+            except (HTTPError, URLError, KeyError, IndexError, ValueError, RuntimeError) as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_seconds * float(attempt + 1))
+                    continue
+        response = self.generate(system_prompt=system_prompt, messages=messages, tool_schemas=tool_schemas)
+        if not (
+            isinstance(response.content, str)
+            and response.content.startswith("Moonshine processed the request in offline mode.")
+        ):
+            if str(response.reasoning_content or "").strip():
+                yield ProviderStreamEvent(type="reasoning_delta", text=response.reasoning_content, raw_payload=response.raw_payload)
+            if response.content:
+                yield ProviderStreamEvent(type="text_delta", text=response.content, raw_payload=response.raw_payload)
+            yield ProviderStreamEvent(type="response", response=response, raw_payload=response.raw_payload)
+            return
+        yield from self._fallback(
+            "streaming responses call failed: %s" % _format_provider_exception(last_exc)
+        ).stream_generate(system_prompt=system_prompt, messages=messages, tool_schemas=tool_schemas)
+
+    def generate_structured(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[Dict[str, str]],
+        response_schema: Dict[str, object],
+        schema_name: str,
+    ) -> Dict[str, object]:
+        prompt = (
+            system_prompt
+            + "\n\nJSON mode instructions:\n"
+            + "- Return exactly one valid JSON object and no markdown fences or explanatory prose.\n"
+            + "- The response must satisfy this JSON schema named `%s`:\n```json\n%s\n```"
+            % (schema_name, json.dumps(response_schema, ensure_ascii=False, indent=2, sort_keys=True))
+        )
+        api_key = os.environ.get(self.api_key_env)
+        if not api_key:
+            raise RuntimeError("structured responses call failed: missing API key environment variable %s" % self.api_key_env)
+        if Request is None or urlopen is None:
+            raise RuntimeError("structured responses call failed: urllib request support is unavailable")
+
+        payload = self._build_payload(
+            system_prompt=prompt,
+            messages=messages,
+            tool_schemas=None,
+            text_format=self._initial_structured_text_format(schema_name=schema_name, response_schema=response_schema),
+        )
+        initial_text_format = payload.get("text", {}).get("format") if isinstance(payload.get("text"), dict) else None
+        retried_with_json_object = bool(isinstance(initial_text_format, dict) and initial_text_format.get("type") == "json_object")
+        retried_without_text_format = not bool(initial_text_format)
+        attempts_remaining = self.max_retries
+        last_exc = None
+        while True:
+            try:
+                request = self._make_request(payload, api_key)
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    parsed_response = json.loads(response.read().decode("utf-8"))
+                response = self._response_from_payload(parsed_response)
+                parsed = _parse_json_object_from_text(response.content)
+                return _coerce_structured_payload(parsed, response_schema)
+            except (HTTPError, URLError, KeyError, IndexError, ValueError, JsonSchemaValidationError) as exc:
+                last_exc = exc
+                if (not retried_with_json_object) and self._should_retry_with_json_object_text_format(exc):
+                    payload = self._build_payload(
+                        system_prompt=prompt,
+                        messages=messages,
+                        tool_schemas=None,
+                        text_format=self._json_object_text_format(),
+                    )
+                    retried_with_json_object = True
+                    if attempts_remaining <= 0:
+                        attempts_remaining = 1
+                    continue
+                if (not retried_without_text_format) and self._should_retry_without_text_format(exc):
+                    payload = self._build_payload(system_prompt=prompt, messages=messages, tool_schemas=None)
+                    retried_without_text_format = True
+                    if attempts_remaining <= 0:
+                        attempts_remaining = 1
+                    continue
+                if attempts_remaining > 0:
+                    attempts_remaining -= 1
+                    time.sleep(self.retry_backoff_seconds * float(self.max_retries - attempts_remaining + 1))
+                    continue
+                break
+        raise RuntimeError("structured responses call failed: %s" % _format_provider_exception(last_exc))
 
 
 class AnthropicMessagesProvider(BaseProvider):

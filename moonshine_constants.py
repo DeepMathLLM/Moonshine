@@ -97,6 +97,9 @@ DEFAULT_CONFIG = {
         "api_version": "",
         "timeout_seconds": 600,
         "temperature": 0.2,
+        "reasoning_effort": "",
+        "reasoning_summary": "",
+        "structured_output_format": "json_schema",
         "stream": True,
         "max_retries": 2,
         "retry_backoff_seconds": 5.0,
@@ -111,6 +114,26 @@ DEFAULT_CONFIG = {
         "api_version": "",
         "timeout_seconds": 600,
         "temperature": 0.2,
+        "reasoning_effort": "",
+        "reasoning_summary": "",
+        "structured_output_format": "json_schema",
+        "stream": False,
+        "max_retries": 2,
+        "retry_backoff_seconds": 5.0,
+        "max_context_tokens": 258000,
+    },
+    "archival_provider": {
+        "inherit_from_main": True,
+        "type": "offline",
+        "model": "moonshine-basic",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "api_version": "",
+        "timeout_seconds": 600,
+        "temperature": 0.2,
+        "reasoning_effort": "",
+        "reasoning_summary": "",
+        "structured_output_format": "json_schema",
         "stream": False,
         "max_retries": 2,
         "retry_backoff_seconds": 5.0,
@@ -583,6 +606,9 @@ class MoonshinePaths:
     def session_tool_events_file(self, session_id: str) -> Path:
         return self.session_dir(session_id) / "tool_events.jsonl"
 
+    def session_tool_event_archives_dir(self, session_id: str) -> Path:
+        return self.session_dir(session_id) / "tool_events"
+
     def session_turn_events_file(self, session_id: str) -> Path:
         return self.session_dir(session_id) / "turn_events.jsonl"
 
@@ -609,7 +635,9 @@ def default_config() -> Dict[str, object]:
         "default_project": DEFAULT_CONFIG["default_project"],
         "provider": dict(DEFAULT_CONFIG["provider"]),
         "verification_provider": dict(DEFAULT_CONFIG["verification_provider"]),
+        "archival_provider": dict(DEFAULT_CONFIG["archival_provider"]),
         "agent": dict(DEFAULT_CONFIG["agent"]),
+        "exposure": dict(DEFAULT_CONFIG["exposure"]),
         "memory": dict(DEFAULT_CONFIG["memory"]),
         "context": dict(DEFAULT_CONFIG["context"]),
     }

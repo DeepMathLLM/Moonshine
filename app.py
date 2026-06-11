@@ -15,7 +15,7 @@ from moonshine.agent_runtime.research_mode import PENDING_RESEARCH_PROJECT, Rese
 from moonshine.credentials import credential_source, get_credential, load_credentials_into_environment, set_credential
 from moonshine.moonshine_cli.commands import execute_slash_command
 from moonshine.moonshine_cli.config import ensure_project_layout, ensure_runtime_home, load_config, resolve_home, save_config
-from moonshine.moonshine_cli.runtime_provider import resolve_runtime_provider, resolve_verification_provider
+from moonshine.moonshine_cli.runtime_provider import resolve_archival_provider, resolve_runtime_provider, resolve_verification_provider
 from moonshine.moonshine_constants import MoonshinePaths
 from moonshine.run_agent import AIAgent, AgentEvent
 from moonshine.skills.manager import SkillManager
@@ -137,6 +137,7 @@ class MoonshineApp(object):
         self.skill_store = self.skill_manager.store
         self.provider = resolve_runtime_provider(self.config)
         self.verification_provider = resolve_verification_provider(self.config, fallback_provider=self.provider)
+        self.archival_provider = resolve_archival_provider(self.config, fallback_provider=self.provider)
         self.research_project_resolver = ResearchProjectResolver(paths=self.paths, provider=self.provider)
         self.memory = MemoryManager(
             self.paths,
@@ -160,6 +161,7 @@ class MoonshineApp(object):
             paths=self.paths,
             provider=self.provider,
             verification_provider=self.verification_provider,
+            archival_provider=self.archival_provider,
             memory_manager=self.memory,
             session_store=self.session_store,
             agent_manager=self.agent_manager,
@@ -173,12 +175,14 @@ class MoonshineApp(object):
         """Re-resolve provider instances after config changes."""
         self.provider = resolve_runtime_provider(self.config)
         self.verification_provider = resolve_verification_provider(self.config, fallback_provider=self.provider)
+        self.archival_provider = resolve_archival_provider(self.config, fallback_provider=self.provider)
         self.research_project_resolver.provider = self.provider
         self.memory.set_provider(self.provider)
         self.context_manager.provider = self.provider
         self.agent.provider = self.provider
         self.agent.verification_provider = self.verification_provider
-        self.agent.research_workflow.provider = self.provider
+        self.agent.archival_provider = self.archival_provider
+        self.agent.research_workflow.provider = self.archival_provider
 
     def startup_notices(self) -> list:
         """Return non-blocking startup notices for optional integrations."""
@@ -249,12 +253,16 @@ class MoonshineApp(object):
             raise ValueError("Azure OpenAI deployment cannot be empty.")
         if not api_key_env:
             raise ValueError("Azure OpenAI api_key_env cannot be empty.")
-        if target not in {"main", "verification"}:
-            raise ValueError("Provider target must be 'main' or 'verification'.")
+        if target not in {"main", "verification", "archival"}:
+            raise ValueError("Provider target must be 'main', 'verification', or 'archival'.")
         if api_key:
             set_credential(self.paths, api_key_env, api_key)
             load_credentials_into_environment(self.paths)
-        provider_config = self.config.provider if target == "main" else self.config.verification_provider
+        provider_config = (
+            self.config.provider
+            if target == "main"
+            else (self.config.verification_provider if target == "verification" else self.config.archival_provider)
+        )
         provider_config.type = "azure_openai"
         provider_config.model = deployment
         provider_config.base_url = endpoint
@@ -262,7 +270,7 @@ class MoonshineApp(object):
         provider_config.api_version = api_version
         provider_config.stream = bool(stream)
         provider_config.temperature = temperature
-        if target == "verification":
+        if target in {"verification", "archival"}:
             provider_config.inherit_from_main = False
         if timeout_seconds is not None:
             provider_config.timeout_seconds = int(timeout_seconds)
@@ -293,6 +301,9 @@ class MoonshineApp(object):
         api_key_env: str = "OPENAI_API_KEY",
         stream: bool = True,
         temperature: Optional[float] = None,
+        reasoning_effort: str = "",
+        reasoning_summary: str = "",
+        structured_output_format: str = "json_schema",
         timeout_seconds: Optional[int] = None,
         max_context_tokens: Optional[int] = None,
         target: str = "main",
@@ -308,12 +319,16 @@ class MoonshineApp(object):
             raise ValueError("OpenAI-compatible model cannot be empty.")
         if not api_key_env:
             raise ValueError("OpenAI-compatible api_key_env cannot be empty.")
-        if target not in {"main", "verification"}:
-            raise ValueError("Provider target must be 'main' or 'verification'.")
+        if target not in {"main", "verification", "archival"}:
+            raise ValueError("Provider target must be 'main', 'verification', or 'archival'.")
         if api_key:
             set_credential(self.paths, api_key_env, api_key)
             load_credentials_into_environment(self.paths)
-        provider_config = self.config.provider if target == "main" else self.config.verification_provider
+        provider_config = (
+            self.config.provider
+            if target == "main"
+            else (self.config.verification_provider if target == "verification" else self.config.archival_provider)
+        )
         provider_config.type = "openai_compatible"
         provider_config.model = model
         provider_config.base_url = base_url
@@ -321,7 +336,10 @@ class MoonshineApp(object):
         provider_config.api_version = ""
         provider_config.stream = bool(stream)
         provider_config.temperature = temperature
-        if target == "verification":
+        provider_config.reasoning_effort = str(reasoning_effort or "").strip()
+        provider_config.reasoning_summary = str(reasoning_summary or "").strip()
+        provider_config.structured_output_format = str(structured_output_format or "json_schema").strip().lower()
+        if target in {"verification", "archival"}:
             provider_config.inherit_from_main = False
         if timeout_seconds is not None:
             provider_config.timeout_seconds = int(timeout_seconds)
@@ -365,25 +383,32 @@ class MoonshineApp(object):
         stream: Optional[bool] = None,
         temperature: Optional[float] = None,
         temperature_specified: bool = False,
+        reasoning_effort: Optional[str] = None,
+        reasoning_summary: Optional[str] = None,
+        structured_output_format: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         max_context_tokens: Optional[int] = None,
         inherit_from_main: Optional[bool] = None,
     ) -> dict:
         """Update one provider configuration incrementally."""
         target = str(target or "main").strip().lower()
-        if target not in {"main", "verification"}:
-            raise ValueError("Provider target must be 'main' or 'verification'.")
-        provider_config = self.config.provider if target == "main" else self.config.verification_provider
+        if target not in {"main", "verification", "archival"}:
+            raise ValueError("Provider target must be 'main', 'verification', or 'archival'.")
+        provider_config = (
+            self.config.provider
+            if target == "main"
+            else (self.config.verification_provider if target == "verification" else self.config.archival_provider)
+        )
         if inherit_from_main is not None:
-            if target != "verification":
-                raise ValueError("inherit_from_main applies only to the verification provider.")
+            if target not in {"verification", "archival"}:
+                raise ValueError("inherit_from_main applies only to secondary providers.")
             provider_config.inherit_from_main = bool(inherit_from_main)
         if provider_type is not None:
             normalized = str(provider_type or "").strip().lower()
             if not normalized:
                 raise ValueError("Provider type cannot be empty.")
             provider_config.type = normalized
-            if target == "verification":
+            if target in {"verification", "archival"}:
                 provider_config.inherit_from_main = False
         if base_url is not None:
             provider_config.base_url = str(base_url or "").strip().rstrip("/")
@@ -397,6 +422,18 @@ class MoonshineApp(object):
             provider_config.stream = bool(stream)
         if temperature_specified:
             provider_config.temperature = temperature
+        if reasoning_effort is not None:
+            provider_config.reasoning_effort = str(reasoning_effort or "").strip()
+        if reasoning_summary is not None:
+            normalized_reasoning_summary = str(reasoning_summary or "").strip().lower()
+            if normalized_reasoning_summary not in {"", "auto", "concise", "detailed"}:
+                raise ValueError("reasoning_summary must be empty or one of auto, concise, or detailed.")
+            provider_config.reasoning_summary = normalized_reasoning_summary
+        if structured_output_format is not None:
+            normalized_structured_output = str(structured_output_format or "json_schema").strip().lower()
+            if normalized_structured_output not in {"auto", "json_schema", "json_object", "prompt"}:
+                raise ValueError("structured_output_format must be one of auto, json_schema, json_object, or prompt.")
+            provider_config.structured_output_format = normalized_structured_output
         if timeout_seconds is not None:
             provider_config.timeout_seconds = int(timeout_seconds)
         if max_context_tokens is not None:
@@ -410,7 +447,7 @@ class MoonshineApp(object):
                 raise ValueError("api_key_env must be set before storing a provider API key.")
             set_credential(self.paths, key_name, api_key)
             load_credentials_into_environment(self.paths)
-        if provider_config.type in {"openai_compatible", "openai_chat", "chat_completions"}:
+        if provider_config.type in {"openai_compatible", "openai_chat", "chat_completions", "openai_responses", "responses"}:
             provider_config.api_version = ""
         save_config(self.paths, self.config)
         self._refresh_runtime_providers()
@@ -423,9 +460,12 @@ class MoonshineApp(object):
             "api_key_env": str(provider_config.api_key_env or ""),
             "stream": bool(provider_config.stream),
             "temperature": provider_config.temperature,
+            "reasoning_effort": str(getattr(provider_config, "reasoning_effort", "") or ""),
+            "reasoning_summary": str(getattr(provider_config, "reasoning_summary", "") or ""),
+            "structured_output_format": str(getattr(provider_config, "structured_output_format", "json_schema") or "json_schema"),
             "timeout_seconds": int(provider_config.timeout_seconds),
             "max_context_tokens": int(provider_config.max_context_tokens),
-            "inherit_from_main": bool(getattr(provider_config, "inherit_from_main", False)) if target == "verification" else False,
+            "inherit_from_main": bool(getattr(provider_config, "inherit_from_main", False)) if target in {"verification", "archival"} else False,
             "credential_file": str(self.paths.credentials_file),
             "config_file": str(self.paths.config_file),
         }
@@ -676,6 +716,7 @@ class MoonshineApp(object):
             )
             final_verification_passed = False
             provider_offline = False
+            provider_offline_reason = ""
             final_text = ""
             for event in self.ask_stream(next_prompt, state):
                 if event.type == "tool_result" and event.text == "verify_overall":
@@ -686,13 +727,19 @@ class MoonshineApp(object):
                 elif event.type == "final":
                     final_text = str(event.text or "").strip()
                     reason = str(event.payload.get("reason") or "").strip()
-                    if reason in {"provider_offline", "verification_provider_offline"}:
+                    if reason in {"provider_offline", "verification_provider_offline", "archival_provider_offline"}:
                         provider_offline = True
+                        provider_offline_reason = reason
                 yield event
             if provider_offline:
+                provider_label = {
+                    "provider_offline": "main",
+                    "verification_provider_offline": "verification",
+                    "archival_provider_offline": "archival",
+                }.get(provider_offline_reason, "required")
                 yield AgentEvent(
                     type="status",
-                    text="Research autopilot stopped because a required provider is offline or unavailable.",
+                    text="Research autopilot stopped because the %s provider is offline or unavailable." % provider_label,
                     payload={"iteration": iteration, "max_iterations": iteration_limit},
                 )
                 return
