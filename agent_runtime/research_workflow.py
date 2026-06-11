@@ -2060,42 +2060,41 @@ class ResearchWorkflowManager(object):
     def _tool_query_memory_artifact(self, arguments: Dict[str, object], output: Dict[str, object]) -> Optional[Dict[str, object]]:
         """Build one navigation note from a successful query_memory result."""
         query = str(arguments.get("query") or output.get("query") or "").strip()
-        compressed = [dict(item) for item in list(output.get("compressed_windows") or []) if isinstance(item, dict)]
-        if not compressed:
+        results = [dict(item) for item in list(output.get("results") or []) if isinstance(item, dict)]
+        if not results:
             return None
-        summary = str(output.get("summary") or "").strip()
-        if not summary:
-            summary = shorten("\n".join(str(item.get("summary") or item.get("title") or "") for item in compressed[:3]), 240)
+        summary = shorten("\n".join(str(item.get("content") or item.get("title") or "") for item in results[:3]), 240)
         if not summary:
             return None
-        scope = "all-projects" if bool(arguments.get("all_projects") or output.get("all_projects")) else str(output.get("project_scope") or arguments.get("project_slug") or "current-project")
+        scope_payload = dict(output.get("scope") or {})
+        scope = "all-projects" if bool(arguments.get("all_projects") or scope_payload.get("all_projects")) else str(scope_payload.get("project_slug") or arguments.get("project_slug") or "current-project")
         source_lines = []
-        for item in compressed[:3]:
+        for item in results[:3]:
             source_lines.append(
                 "- [%s] %s\n  %s"
                 % (
                     str(item.get("source") or "memory"),
                     str(item.get("title") or "retrieved context"),
-                    shorten(str(item.get("summary") or item.get("window_excerpt") or ""), 240),
+                    shorten(str(item.get("content") or item.get("local_context") or ""), 240),
                 )
             )
         content = (
             "Query: %s\n"
             "Project scope: %s\n"
                 "Type scope: %s\n"
-            "Retrieved windows: %s\n\n"
+            "Retrieved results: %s\n\n"
             "Top sources:\n%s"
         ) % (
             query or "(empty query)",
             scope or "current-project",
-            ", ".join(str(item) for item in list(output.get("channels") or arguments.get("channels") or []) if str(item).strip()) or "(default)",
-            len(compressed),
+            ", ".join(str(item) for item in list(scope_payload.get("types") or arguments.get("types") or arguments.get("channels") or []) if str(item).strip()) or "(default)",
+            len(results),
             "\n".join(source_lines) or "- (no detailed windows)",
         )
         tag_list = ["retrieval", "query-memory"]
-        if bool(arguments.get("all_projects") or output.get("all_projects")):
+        if bool(arguments.get("all_projects") or scope_payload.get("all_projects")):
             tag_list.append("cross-project")
-        if list(output.get("channels") or arguments.get("channels") or []):
+        if list(scope_payload.get("types") or arguments.get("types") or arguments.get("channels") or []):
             tag_list.append("channel-scoped")
         return {
             "artifact_type": "note",
@@ -2106,8 +2105,8 @@ class ResearchWorkflowManager(object):
             "metadata": {
                 "query": query,
                 "project_scope": scope,
-                "window_count": len(compressed),
-                "source_kinds": _dedupe_strings([item.get("source", "") for item in compressed]),
+                "result_count": len(results),
+                "source_kinds": _dedupe_strings([item.get("source", "") for item in results]),
             },
             "signature": "query-memory|%s|%s" % (scope, self._normalize_compact_text(query)),
         }

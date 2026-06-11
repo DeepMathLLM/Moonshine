@@ -10,6 +10,7 @@ from moonshine.agent_runtime.model_metadata import resolve_model_context_window
 from moonshine.agent_runtime.memory_provider import ContextBundle
 from moonshine.agent_runtime.research_log import ResearchLogStore, normalize_research_log_type
 from moonshine.providers import OfflineProvider
+from moonshine.storage.session_store import RETRIEVAL_TOOL_EVENT_NAMES
 from moonshine.utils import (
     append_jsonl,
     estimate_structured_token_count,
@@ -996,6 +997,20 @@ class ContextManager(object):
             parts.append("Error: %s" % item.get("error"))
         return "\n".join(parts)
 
+    def _render_tool_event_payload_for_search(self, item: Dict[str, object]) -> str:
+        """Render one complete restored tool event as the searchable unit."""
+        return self._stringify_payload(
+            {
+                "tool": item.get("tool", ""),
+                "call_id": item.get("call_id", ""),
+                "arguments": item.get("arguments", {}),
+                "output": item.get("output", {}),
+                "error": item.get("error"),
+                "tool_round": item.get("tool_round", ""),
+                "created_at": item.get("created_at", ""),
+            }
+        )
+
     def _render_provider_round(self, item: Dict[str, object]) -> str:
         """Render one provider round as compact trace text."""
         lines = [
@@ -1071,18 +1086,37 @@ class ContextManager(object):
         anchor_created_at: str,
         limit: int = 2,
     ) -> List[str]:
-        """Select the most relevant tool events for one session hit."""
+        """Select the most relevant indexed tool events for one session hit."""
         ranked = []
-        for item in self.session_store.get_tool_events(session_id):
-            rendered = self._render_tool_event(item)
+        recall_query = " ".join(part for part in [query, anchor_text] if str(part or "").strip())
+        for item in self.session_store.search_tool_events(session_id, recall_query or query, limit=max(limit * 6, 6)):
+            if str(item.get("tool") or "").strip() in RETRIEVAL_TOOL_EVENT_NAMES:
+                continue
+            rendered_payload = str(item.get("_search_text") or "") or self._render_tool_event_payload_for_search(item)
             score = self._score_related_blob(
                 query=query,
                 anchor_text=anchor_text,
-                blob=rendered,
+                blob=rendered_payload,
                 anchor_created_at=anchor_created_at,
                 candidate_created_at=str(item.get("created_at", "")),
             )
             if score > 0:
+                event_id = str(item.get("event_id") or item.get("id") or item.get("call_id") or "")
+                archive_path = str(item.get("archive_path") or "")
+                rendered = (
+                    "## Related Tool Result\n"
+                    "event_id: {event_id}\n"
+                    "tool: {tool}\n"
+                    "archive_path: {archive_path}\n"
+                    "score: {score:.4f}\n\n"
+                    "```json\n{payload}\n```"
+                ).format(
+                    event_id=event_id or "(none)",
+                    tool=str(item.get("tool") or ""),
+                    archive_path=archive_path or "(inline legacy record)",
+                    score=float(score),
+                    payload=rendered_payload,
+                )
                 ranked.append((score, rendered))
         ranked.sort(key=lambda pair: pair[0], reverse=True)
         return [pair[1] for pair in ranked[:limit]]
@@ -1113,13 +1147,18 @@ class ContextManager(object):
         return [pair[1] for pair in ranked[:limit]]
 
     def _build_session_context_window(self, item: Dict[str, object], query: str) -> str:
-        """Reconstruct a local complete session window around one anchor hit."""
+        """Reconstruct a local session window from the unified session-record index."""
         metadata = dict(item.get("metadata") or {})
         session_id = str(metadata.get("session_id", ""))
-        anchor_message_id = metadata.get("message_id")
-        anchor_event_id = metadata.get("event_id")
-        anchor_text = str(item.get("text", ""))
-        anchor_created_at = str(metadata.get("created_at", ""))
+        record_id = str(metadata.get("record_id") or item.get("record_id") or "").strip()
+        if not record_id and metadata.get("message_id") is not None:
+            record_id = "msg:%s" % metadata.get("message_id")
+        if not record_id and metadata.get("event_id") is not None:
+            source = str(metadata.get("source") or "")
+            if source == "tool_events":
+                record_id = "tool:%s" % metadata.get("event_id")
+            else:
+                record_id = "event:%s" % metadata.get("event_id")
         lines = [
             "## Session Window",
             "Session: %s" % session_id,
@@ -1127,70 +1166,42 @@ class ContextManager(object):
         if metadata.get("project_slug"):
             lines.append("Project: %s" % metadata.get("project_slug"))
         lines.append("Anchor: %s" % item.get("title", "session-hit"))
-
-        conversation_window = []
-        if session_id and anchor_message_id is not None:
-            conversation_window = self.session_store.get_conversation_window(
+        if session_id and record_id:
+            record_window = self.session_store.get_session_record_window(
                 session_id,
-                anchor_message_id=int(anchor_message_id),
-                anchor_event_id=int(anchor_event_id) if anchor_event_id is not None else None,
+                record_id,
                 before=4,
                 after=6,
             )
-        elif session_id and anchor_event_id is not None:
-            conversation_window = self.session_store.get_conversation_window(
-                session_id,
-                anchor_event_id=int(anchor_event_id),
-                before=4,
-                after=6,
-            )
-        if conversation_window:
-            lines.append("### Local Event Sequence")
-            for event in conversation_window:
-                lines.append(self._render_conversation_event(event))
-        elif session_id and anchor_message_id is not None:
-            raw_window = self.session_store.get_message_window(
-                session_id,
-                int(anchor_message_id),
-                before=2,
-                after=2,
-            )
-            if raw_window:
-                lines.append("### Nearby Messages")
-                for message in raw_window:
-                    metadata = dict(message.get("metadata") or {})
-                    provider_like = {
-                        "role": message["role"],
-                    }
-                    reasoning_content = str(metadata.get("reasoning_content") or "").strip()
-                    if reasoning_content:
-                        provider_like["reasoning_content"] = reasoning_content
-                    provider_like["content"] = message["content"]
-                    lines.append(json.dumps(provider_like, ensure_ascii=False))
-
-        if session_id:
-            tool_windows = self._select_related_tool_events(
-                session_id=session_id,
-                query=query,
-                anchor_text=anchor_text,
-                anchor_created_at=anchor_created_at,
-                limit=2,
-            )
-            if tool_windows:
-                lines.append("### Related Tool Results")
-                lines.extend(tool_windows)
-
-            provider_windows = self._select_related_provider_rounds(
-                session_id=session_id,
-                query=query,
-                anchor_text=anchor_text,
-                anchor_created_at=anchor_created_at,
-                limit=1,
-            )
-            if provider_windows:
-                lines.append("### Related Provider Round")
-                lines.extend(provider_windows)
+            if record_window:
+                lines.append("### Local Session Records")
+                for record in record_window:
+                    lines.append(self._render_session_record(record))
+        if len(lines) <= 3:
+            lines.append(str(item.get("text") or ""))
         return "\n".join(line for line in lines if line)
+
+    def _render_session_record(self, item: Dict[str, object]) -> str:
+        """Render one unified session record for local-window recovery."""
+        metadata = dict(item.get("metadata") or {})
+        header = "[{record_type}/{role}] {title}".format(
+            record_type=str(item.get("record_type") or item.get("type") or "record"),
+            role=str(item.get("role") or "unknown"),
+            title=str(item.get("title") or ""),
+        )
+        refs = [
+            "record_id: %s" % str(item.get("record_id") or ""),
+            "created_at: %s" % str(item.get("created_at") or ""),
+        ]
+        if metadata.get("source"):
+            refs.append("source: %s" % str(metadata.get("source") or ""))
+        if metadata.get("archive_path"):
+            refs.append("archive_path: %s" % str(metadata.get("archive_path") or ""))
+        return "%s\n%s\n%s" % (
+            header,
+            "\n".join(ref for ref in refs if ref.strip()),
+            str(item.get("content") or "").strip(),
+        )
 
     def _build_dynamic_context_window(self, item: Dict[str, object], query: str) -> str:
         """Reconstruct a local context window around one dynamic-memory hit."""
@@ -1437,6 +1448,66 @@ class ContextManager(object):
             )
         return normalized
 
+    def _normalize_tool_event_hits(self, rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        """Normalize indexed tool-event hits."""
+        normalized = []
+        for index, item in enumerate(rows):
+            event_id = str(item.get("event_id") or item.get("id") or item.get("call_id") or index)
+            rendered = str(item.get("_search_text") or "") or self._render_tool_event_payload_for_search(item)
+            normalized.append(
+                {
+                    "key": "tool-event:%s" % event_id,
+                    "source": "tool-event",
+                    "rank": index + 1,
+                    "title": "[tool/%s] %s" % (
+                        str(item.get("tool") or "unknown"),
+                        shorten(rendered, 72),
+                    ),
+                    "text": rendered,
+                    "metadata": {
+                        "event_id": event_id,
+                        "tool": str(item.get("tool") or ""),
+                        "call_id": str(item.get("call_id") or ""),
+                        "session_id": str(item.get("session_id") or ""),
+                        "created_at": str(item.get("created_at") or ""),
+                        "archive_path": str(item.get("archive_path") or ""),
+                    },
+                }
+            )
+        return normalized
+
+    def _normalize_session_record_hits(self, rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        """Normalize unified session-record hits."""
+        normalized = []
+        for index, item in enumerate(rows):
+            record_id = str(item.get("record_id") or item.get("id") or index)
+            project_label = ("[%s] " % item.get("project_slug")) if item.get("project_slug") else ""
+            metadata = dict(item.get("metadata") or {})
+            metadata.setdefault("session_id", str(item.get("session_id") or ""))
+            metadata.setdefault("record_id", record_id)
+            metadata.setdefault("record_type", str(item.get("record_type") or "record"))
+            metadata.setdefault("role", str(item.get("role") or ""))
+            metadata.setdefault("created_at", str(item.get("created_at") or ""))
+            metadata.setdefault("project_slug", str(item.get("project_slug") or ""))
+            normalized.append(
+                {
+                    "key": "session-record:%s:%s" % (str(item.get("session_id") or ""), record_id),
+                    "source": "session-record",
+                    "rank": index + 1,
+                    "title": "%s[%s/%s] %s"
+                    % (
+                        project_label,
+                        str(item.get("record_type") or "record"),
+                        str(item.get("role") or ""),
+                        shorten(str(item.get("title") or item.get("content") or ""), 72),
+                    ),
+                    "text": str(item.get("content") or ""),
+                    "metadata": metadata,
+                    "score": float(item.get("score") or 0.0),
+                }
+            )
+        return normalized
+
     def _normalize_dynamic_hits(self, rows: Sequence[object]) -> List[Dict[str, object]]:
         """Normalize dynamic-memory search hits."""
         normalized = []
@@ -1593,187 +1664,114 @@ class ContextManager(object):
         limit_per_channel: int = 3,
         prefer_raw: bool = False,
     ) -> Dict[str, object]:
-        """Run on-demand retrieval across memory layers.
-
-        Project research memory is sourced only from research_log.jsonl and its
-        rebuildable SQLite index. `types` is the preferred research-log scope;
-        `channels` is accepted as a legacy alias. If no project research-log hit
-        is found, fall back to non-project memory layers.
-        """
+        """Run on-demand retrieval through non-overlapping memory sources."""
         research_log_types: List[str] = []
         for type_name in list(types or []) + list(channels or []):
             normalized_type = normalize_research_log_type(str(type_name))
             if normalized_type and normalized_type not in research_log_types:
                 research_log_types.append(normalized_type)
+
+        result_limit = max(1, int(limit_per_channel or 3))
         research_log_hits = self.research_log.search(
             query=query,
             project_slug=project_slug,
             types=research_log_types,
-            limit=max(1, int(limit_per_channel or 3) * max(1, len(research_log_types) or 1)),
+            limit=result_limit * max(1, len(research_log_types) or 1),
         )
-        if research_log_hits:
-            summary_lines = [
-                "[{record_type}] {title}\n{content}".format(
-                    record_type=str(item.get("type") or item.get("artifact_type") or "research_note"),
-                    title=str(item.get("title") or ""),
-                    content=str(item.get("content_inline") or item.get("content") or ""),
-                )
-                for item in research_log_hits[:6]
-            ]
-            return {
-                "query": query,
-                "project_scope": project_slug or "all-projects",
-                "all_projects": bool(all_projects),
-                "types": research_log_types,
-                "channels": research_log_types,
-                "channel_mode": str(channel_mode or "search"),
-                "limit_per_channel": int(limit_per_channel or 3),
-                "prefer_raw": True,
-                "summary": "\n\n".join(summary_lines),
-                "compressed_windows": [
-                    {
-                        "key": str(item.get("key") or item.get("id") or ""),
-                        "source": "research-log",
-                        "title": str(item.get("title") or ""),
-                        "rrf_score": float(item.get("score") or 0.0),
-                        "summary": str(item.get("content_inline") or item.get("content") or ""),
-                        "window_excerpt": str(item.get("content_inline") or item.get("content") or ""),
-                        "metadata": dict(item.get("metadata") or {}),
-                    }
-                    for item in research_log_hits[:4]
-                ],
-                "sources": research_log_hits[:6],
-                "research_log_hits": research_log_hits,
-                "research_hits": research_log_hits,
-                "dynamic_hits": [],
-                "session_hits": [],
-                "event_hits": [],
-                "knowledge_hits": [],
-                "graph_hits": [],
-            }
-        if research_log_types:
-            return {
-                "query": query,
-                "project_scope": project_slug or "all-projects",
-                "all_projects": bool(all_projects),
-                "types": research_log_types,
-                "channels": research_log_types,
-                "channel_mode": str(channel_mode or "search"),
-                "limit_per_channel": int(limit_per_channel or 3),
-                "prefer_raw": True,
-                "summary": "",
-                "compressed_windows": [],
-                "sources": [],
-                "research_log_hits": [],
-                "research_hits": [],
-                "dynamic_hits": [],
-                "session_hits": [],
-                "event_hits": [],
-                "knowledge_hits": [],
-                "graph_hits": [],
-            }
-        raw_hits = self.memory_manager.query_memory_sources(
-            query,
-            project_slug,
-            session_id,
-            research_channels=[],
-            research_channel_mode=channel_mode,
-            limit_per_channel=limit_per_channel,
-        )
+
+        raw_hits: Dict[str, object] = {}
+        if not research_log_types:
+            raw_hits = self.memory_manager.query_memory_sources(
+                query,
+                project_slug,
+                session_id,
+                research_channels=[],
+                research_channel_mode=channel_mode,
+                limit_per_channel=limit_per_channel,
+            )
         dynamic_hits = list(raw_hits.get("dynamic_hits") or [])
-        session_hits = list(raw_hits.get("session_hits") or [])
-        event_hits = list(raw_hits.get("event_hits") or [])
+        session_record_hits = list(raw_hits.get("session_record_hits") or [])
         knowledge_hits = list(raw_hits.get("knowledge_hits") or [])
-        research_hits: List[Dict[str, object]] = []
-        graph_hits: List[Dict[str, object]] = list(raw_hits.get("graph_hits") or [])
-        ranked_lists = [
-            self._normalize_dynamic_hits(dynamic_hits),
-            self._normalize_session_hits(session_hits),
-            self._normalize_event_hits(event_hits),
-            self._normalize_knowledge_hits(knowledge_hits),
-        ]
+
+        ranked_lists = [self._normalize_research_hits(research_log_hits)]
+        if not research_log_types:
+            ranked_lists.extend(
+                [
+                    self._normalize_session_record_hits(session_record_hits),
+                    self._normalize_dynamic_hits(dynamic_hits),
+                    self._normalize_knowledge_hits(knowledge_hits),
+                ]
+            )
         merged = self._rrf_merge(ranked_lists)
 
-        window_limit = min(4, len(merged))
-        per_window_budget = max(
-            180,
-            min(
-                320,
-                int(self.config.context.retrieval_summary_token_budget / max(1, window_limit)),
-            ),
-        )
-        compressed_windows = []
-        for item in merged[:window_limit]:
-            if item["source"] == "session":
-                window_text = self._build_session_context_window(item, query)
-            elif item["source"] == "session-event":
-                window_text = self._build_session_context_window(item, query)
-            elif item["source"] == "dynamic":
-                window_text = self._build_dynamic_context_window(item, query)
-            elif item["source"] == "knowledge":
-                window_text = self._build_knowledge_context_window(item, query)
-            else:
-                window_text = "[%s] %s\n%s" % (item["source"], item["title"], item["text"])
-            if prefer_raw:
-                summary = self._trim_text_to_budget(window_text, per_window_budget)
-            else:
-                summary = self._summarize_with_provider(
-                    purpose="%s local context window" % item["source"],
-                    text=window_text,
-                    token_budget=per_window_budget,
-                )
-            compressed_windows.append(
-                {
-                    "key": item["key"],
-                    "source": item["source"],
-                    "title": item["title"],
-                    "rrf_score": item["rrf_score"],
-                    "summary": summary,
-                    "window_excerpt": self._trim_text_to_budget(window_text, max(per_window_budget * 2, 240)),
-                    "metadata": dict(item.get("metadata") or {}),
+        results: List[Dict[str, object]] = []
+        for item in merged[: max(1, result_limit * 4)]:
+            source = str(item.get("source") or "")
+            metadata = dict(item.get("metadata") or {})
+            result: Dict[str, object] = {
+                "source": source,
+                "type": str(
+                    metadata.get("record_type")
+                    or metadata.get("artifact_type")
+                    or metadata.get("source_type")
+                    or source
+                ),
+                "title": str(item.get("title") or ""),
+                "content": str(item.get("text") or ""),
+                "score": float(item.get("rrf_score") or item.get("score") or 0.0),
+                "source_refs": {},
+            }
+            if source == "research-log":
+                result["content"] = str(metadata.get("raw_text") or metadata.get("content_inline") or item.get("text") or "")
+                result["source_refs"] = {
+                    "project_slug": str(metadata.get("project_slug") or project_slug or ""),
+                    "record_id": str(metadata.get("artifact_id") or ""),
+                    "path": str(metadata.get("source_path") or metadata.get("content_path") or ""),
+                    "source_refs": list(metadata.get("source_refs") or []),
                 }
-            )
+            elif source == "session-record":
+                window_text = self._build_session_context_window(item, query)
+                result["local_context"] = window_text
+                result["source_refs"] = {
+                    "session_id": str(metadata.get("session_id") or ""),
+                    "record_id": str(metadata.get("record_id") or ""),
+                    "record_type": str(metadata.get("record_type") or ""),
+                    "archive_path": str(metadata.get("archive_path") or ""),
+                }
+            elif source == "dynamic":
+                result["local_context"] = self._build_dynamic_context_window(item, query)
+                result["source_refs"] = {
+                    "path": str(metadata.get("relative_path") or ""),
+                    "project_slug": str(metadata.get("project_slug") or ""),
+                    "source_session_id": str(metadata.get("source_session_id") or ""),
+                }
+            elif source == "knowledge":
+                result["local_context"] = self._build_knowledge_context_window(item, query)
+                result["source_refs"] = {
+                    "id": str(metadata.get("id") or ""),
+                    "path": str(metadata.get("path") or ""),
+                    "project_slug": str(metadata.get("project_slug") or ""),
+                    "source_ref": str(metadata.get("source_ref") or ""),
+                }
+            else:
+                result["source_refs"] = dict(metadata)
+            results.append(result)
 
-        summary_inputs = []
-        for window in compressed_windows:
-            summary_inputs.append(
-                "[%s] %s\n%s" % (window["source"], window["title"], window["summary"])
-            )
-        if not summary_inputs:
-            for item in merged[:6]:
-                summary_inputs.append("[%s] %s: %s" % (item["source"], item["title"], shorten(item["text"], 180)))
-        if not summary_inputs:
-            summary_inputs.append("[graph] Knowledge graph layer is disabled in this build.")
-        elif not graph_hits:
-            summary_inputs.append("[graph] Knowledge graph layer is disabled in this build.")
+        locations: Dict[str, object] = {}
+        if project_slug:
+            locations["project_research_log"] = self.paths.project_research_log_file(project_slug).relative_to(self.paths.home).as_posix()
+            locations["project_research_log_index"] = self.paths.project_research_log_index_file(project_slug).relative_to(self.paths.home).as_posix()
+        if session_id:
+            locations["active_session"] = self.paths.session_dir(session_id).relative_to(self.paths.home).as_posix()
+        locations["session_index"] = self.paths.sessions_db.relative_to(self.paths.home).as_posix()
 
-        if prefer_raw:
-            summary = self._trim_text_to_budget(
-                "\n\n".join(summary_inputs),
-                self.config.context.retrieval_summary_token_budget,
-            )
-        else:
-            summary = self._summarize_with_provider(
-                purpose="retrieved memory windows",
-                text="\n\n".join(summary_inputs),
-                token_budget=self.config.context.retrieval_summary_token_budget,
-            )
         return {
             "query": query,
-            "project_scope": project_slug or "all-projects",
-            "all_projects": bool(all_projects),
-            "types": research_log_types,
-            "channels": research_log_types,
-            "channel_mode": str(channel_mode or "search"),
-            "limit_per_channel": int(limit_per_channel or 3),
-            "prefer_raw": bool(prefer_raw),
-            "summary": summary,
-            "compressed_windows": compressed_windows,
-            "sources": merged[:6],
-            "dynamic_hits": self._serialize_dynamic_hit_rows(dynamic_hits),
-            "session_hits": session_hits,
-            "event_hits": event_hits,
-            "research_hits": research_hits,
-            "knowledge_hits": knowledge_hits,
-            "graph_hits": graph_hits,
+            "scope": {
+                "project_slug": project_slug or "",
+                "all_projects": bool(all_projects),
+                "types": research_log_types,
+            },
+            "results": results,
+            "raw_record_locations": locations,
         }

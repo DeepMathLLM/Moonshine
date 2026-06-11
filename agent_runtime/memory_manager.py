@@ -991,26 +991,9 @@ class MemoryManager(MemoryProvider):
         limit_per_channel: int = 3,
     ) -> Dict[str, object]:
         """Return raw retrieval hits across implemented memory layers."""
-        selected_channels = [str(channel) for channel in list(research_channels or []) if str(channel).strip()]
-        research_hits = (
-            self._search_research_channels(
-                query=query,
-                project_slug=project_slug,
-                channels=selected_channels,
-                channel_mode=research_channel_mode,
-                limit_per_channel=limit_per_channel,
-            )
-            if selected_channels
-            else self._search_research_state_artifacts(query=query, project_slug=project_slug, limit=5)
-        )
         return {
             "dynamic_hits": self.dynamic_store.search(query=query, project_slug=project_slug, limit=5),
-            "session_hits": self.session_store.search_messages(
-                query=query,
-                limit=self.config.memory.session_search_limit,
-                project_slug=project_slug,
-            ),
-            "event_hits": self.session_store.search_conversation_events(
+            "session_record_hits": self.session_store.search_session_records(
                 query=query,
                 limit=self.config.memory.session_search_limit,
                 project_slug=project_slug,
@@ -1020,7 +1003,7 @@ class MemoryManager(MemoryProvider):
                 limit=self.config.memory.knowledge_search_limit,
                 project_slug=project_slug,
             ),
-            "research_hits": research_hits,
+            "research_hits": [],
             "graph_hits": [],
         }
 
