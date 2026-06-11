@@ -30,6 +30,7 @@ def _resolve_provider_settings(provider_config) -> BaseProvider:
             api_key_env=provider_config.api_key_env,
             timeout_seconds=provider_config.timeout_seconds,
             temperature=provider_config.temperature,
+            reasoning_effort=getattr(provider_config, "reasoning_effort", ""),
             stream=provider_config.stream,
             max_retries=provider_config.max_retries,
             retry_backoff_seconds=provider_config.retry_backoff_seconds,
@@ -43,6 +44,7 @@ def _resolve_provider_settings(provider_config) -> BaseProvider:
             api_version=provider_config.api_version or "2024-12-01-preview",
             timeout_seconds=provider_config.timeout_seconds,
             temperature=provider_config.temperature,
+            reasoning_effort=getattr(provider_config, "reasoning_effort", ""),
             stream=provider_config.stream,
             max_retries=provider_config.max_retries,
             retry_backoff_seconds=provider_config.retry_backoff_seconds,
@@ -53,6 +55,15 @@ def _resolve_provider_settings(provider_config) -> BaseProvider:
             model=provider_config.model,
             base_url=provider_config.base_url,
             api_key_env=provider_config.api_key_env,
+            timeout_seconds=provider_config.timeout_seconds,
+            temperature=provider_config.temperature,
+            reasoning_effort=getattr(provider_config, "reasoning_effort", ""),
+            reasoning_summary=getattr(provider_config, "reasoning_summary", ""),
+            structured_output_format=getattr(provider_config, "structured_output_format", "json_schema"),
+            stream=provider_config.stream,
+            max_retries=provider_config.max_retries,
+            retry_backoff_seconds=provider_config.retry_backoff_seconds,
+            max_context_tokens=max_context_tokens,
         )
     if provider_type in {"anthropic", "anthropic_messages"}:
         return AnthropicMessagesProvider(
@@ -73,3 +84,11 @@ def resolve_verification_provider(config: AppConfig, *, fallback_provider: BaseP
     if bool(getattr(verification, "inherit_from_main", True)):
         return fallback_provider
     return _resolve_provider_settings(verification)
+
+
+def resolve_archival_provider(config: AppConfig, *, fallback_provider: BaseProvider) -> BaseProvider:
+    """Resolve the dedicated research-archival provider or inherit the main provider."""
+    archival = config.archival_provider
+    if bool(getattr(archival, "inherit_from_main", True)):
+        return fallback_provider
+    return _resolve_provider_settings(archival)

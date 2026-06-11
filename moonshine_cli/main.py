@@ -294,10 +294,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     provider_parser = subparsers.add_parser("provider", help="Configure or inspect the active LLM provider")
     provider_parser.add_argument("--show", action="store_true", help="Show the active provider configuration.")
-    provider_parser.add_argument("--target", choices=["main", "verification"], default="main", help="Select which provider configuration to manage.")
-    provider_parser.add_argument("--type", default=None, help="Set the provider type directly, for example offline, azure_openai, or openai_compatible.")
+    provider_parser.add_argument("--target", choices=["main", "verification", "archival"], default="main", help="Select which provider configuration to manage.")
+    provider_parser.add_argument("--type", default=None, help="Set the provider type directly, for example offline, azure_openai, openai_compatible, or openai_responses.")
     provider_parser.add_argument("--azure-openai", action="store_true", help="Configure Azure OpenAI chat completions.")
     provider_parser.add_argument("--openai-compatible", action="store_true", help="Configure an OpenAI-compatible chat completions provider.")
+    provider_parser.add_argument("--openai-responses", action="store_true", help="Configure an OpenAI-compatible Responses API provider.")
     provider_parser.add_argument("--endpoint", default=None, help="Set the Azure OpenAI endpoint, for example https://name.openai.azure.com/.")
     provider_parser.add_argument("--base-url", default=None, help="Set the OpenAI-compatible base URL, for example https://api.openai.com/v1.")
     provider_parser.add_argument("--deployment", default=None, help="Set the Azure OpenAI deployment name.")
@@ -316,9 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
     provider_parser.add_argument("--no-stream", action="store_true", help="Disable provider streaming.")
     provider_parser.add_argument("--temperature", type=float, default=None, help="Optional temperature. Omit for Azure GPT-5 deployments.")
     provider_parser.add_argument("--clear-temperature", action="store_true", help="Clear the configured temperature and let the provider default apply.")
+    provider_parser.add_argument("--reasoning-effort", default=None, choices=["", "minimal", "low", "medium", "high", "xhigh"], help="Optional reasoning effort to pass to compatible providers.")
+    provider_parser.add_argument("--reasoning-summary", default=None, choices=["", "auto", "concise", "detailed"], help="Optional Responses API reasoning summary mode. Empty means do not send the parameter.")
+    provider_parser.add_argument("--structured-output-format", default=None, choices=["auto", "json_schema", "json_object", "prompt"], help="Structured-output mode for JSON tasks. Default is json_schema; auto is treated as json_schema first, with compatibility fallback.")
     provider_parser.add_argument("--timeout-seconds", type=int, default=None)
-    provider_parser.add_argument("--inherit-main", action="store_true", help="For verification provider only, inherit the main provider instead of using a dedicated one.")
-    provider_parser.add_argument("--dedicated", action="store_true", help="For verification provider only, use a dedicated verification provider instead of inheriting the main provider.")
+    provider_parser.add_argument("--inherit-main", action="store_true", help="For secondary providers, inherit the main provider instead of using a dedicated one.")
+    provider_parser.add_argument("--dedicated", action="store_true", help="For secondary providers, use a dedicated provider instead of inheriting the main provider.")
     provider_parser.add_argument(
         "--max-context-tokens",
         type=int,
@@ -511,6 +515,9 @@ def main(argv: Optional[list] = None) -> int:
                 bool(args.no_stream),
                 args.temperature is not None,
                 bool(args.clear_temperature),
+                args.reasoning_effort is not None,
+                args.reasoning_summary is not None,
+                args.structured_output_format is not None,
                 args.timeout_seconds is not None,
                 args.max_context_tokens is not None,
                 bool(args.inherit_main),
@@ -527,6 +534,11 @@ def main(argv: Optional[list] = None) -> int:
             if provider.api_version:
                 print("API version: %s" % provider.api_version)
             print("Stream: %s" % str(provider.stream).lower())
+            if getattr(provider, "reasoning_effort", ""):
+                print("Reasoning effort: %s" % provider.reasoning_effort)
+            if getattr(provider, "reasoning_summary", ""):
+                print("Reasoning summary: %s" % provider.reasoning_summary)
+            print("Structured output format: %s" % getattr(provider, "structured_output_format", "json_schema"))
             print(
                 "Max context tokens: %s"
                 % resolve_model_context_window(provider.model, configured=provider.max_context_tokens)
@@ -542,20 +554,46 @@ def main(argv: Optional[list] = None) -> int:
             if verification.api_version:
                 print("API version: %s" % verification.api_version)
             print("Stream: %s" % str(verification.stream).lower())
+            if getattr(verification, "reasoning_effort", ""):
+                print("Reasoning effort: %s" % verification.reasoning_effort)
+            if getattr(verification, "reasoning_summary", ""):
+                print("Reasoning summary: %s" % verification.reasoning_summary)
+            print("Structured output format: %s" % getattr(verification, "structured_output_format", "json_schema"))
             print(
                 "Max context tokens: %s"
                 % resolve_model_context_window(verification.model, configured=verification.max_context_tokens)
             )
+            archival = app.config.archival_provider
+            print("")
+            print("[archival]")
+            print("Inherit main provider: %s" % str(archival.inherit_from_main).lower())
+            print("Provider: %s" % archival.type)
+            print("Model/deployment: %s" % archival.model)
+            print("Base URL/endpoint: %s" % archival.base_url)
+            print("API key env: %s" % archival.api_key_env)
+            if archival.api_version:
+                print("API version: %s" % archival.api_version)
+            print("Stream: %s" % str(archival.stream).lower())
+            if getattr(archival, "reasoning_effort", ""):
+                print("Reasoning effort: %s" % archival.reasoning_effort)
+            if getattr(archival, "reasoning_summary", ""):
+                print("Reasoning summary: %s" % archival.reasoning_summary)
+            print("Structured output format: %s" % getattr(archival, "structured_output_format", "json_schema"))
+            print(
+                "Max context tokens: %s"
+                % resolve_model_context_window(archival.model, configured=archival.max_context_tokens)
+            )
             if not update_requested:
                 return 0
-        if args.azure_openai and args.openai_compatible:
-            print("Choose only one provider family: --azure-openai or --openai-compatible.")
+        selected_provider_flags = [bool(args.azure_openai), bool(args.openai_compatible), bool(args.openai_responses)]
+        if sum(1 for selected in selected_provider_flags if selected) > 1:
+            print("Choose only one provider family: --azure-openai, --openai-compatible, or --openai-responses.")
             return 1
         if args.inherit_main and args.dedicated:
-            print("Choose only one verification mode: --inherit-main or --dedicated.")
+            print("Choose only one secondary-provider mode: --inherit-main or --dedicated.")
             return 1
-        if (args.inherit_main or args.dedicated) and args.target != "verification":
-            print("--inherit-main and --dedicated apply only to --target verification.")
+        if (args.inherit_main or args.dedicated) and args.target not in {"verification", "archival"}:
+            print("--inherit-main and --dedicated apply only to --target verification or --target archival.")
             return 1
 
         provider_type = args.type
@@ -563,6 +601,8 @@ def main(argv: Optional[list] = None) -> int:
             provider_type = "azure_openai"
         if args.openai_compatible:
             provider_type = "openai_compatible"
+        if args.openai_responses:
+            provider_type = "openai_responses"
 
         if args.endpoint is not None and args.base_url is not None and args.endpoint.strip().rstrip("/") != args.base_url.strip().rstrip("/"):
             print("--endpoint and --base-url should not disagree in the same command.")
@@ -571,14 +611,18 @@ def main(argv: Optional[list] = None) -> int:
             print("--deployment and --model should not disagree in the same command.")
             return 1
 
-        provider_config = app.config.provider if args.target == "main" else app.config.verification_provider
+        provider_config = (
+            app.config.provider
+            if args.target == "main"
+            else (app.config.verification_provider if args.target == "verification" else app.config.archival_provider)
+        )
         inferred_api_key_env = args.api_key_env
         if inferred_api_key_env is None and provider_type:
             current_key_name = str(provider_config.api_key_env or "").strip()
             normalized_type = str(provider_type).strip().lower()
             if normalized_type in {"azure_openai", "azure", "azure_chat_completions"} and current_key_name in {"", "OPENAI_API_KEY"}:
                 inferred_api_key_env = "AZURE_OPENAI_API_KEY"
-            if normalized_type in {"openai_compatible", "openai_chat", "chat_completions"} and current_key_name in {"", "AZURE_OPENAI_API_KEY"}:
+            if normalized_type in {"openai_compatible", "openai_chat", "chat_completions", "openai_responses", "responses"} and current_key_name in {"", "AZURE_OPENAI_API_KEY"}:
                 inferred_api_key_env = "OPENAI_API_KEY"
 
         stream_value = True if args.stream else (False if args.no_stream else None)
@@ -617,6 +661,9 @@ def main(argv: Optional[list] = None) -> int:
                 stream=stream_value,
                 temperature=temperature_value,
                 temperature_specified=temperature_specified,
+                reasoning_effort=args.reasoning_effort,
+                reasoning_summary=args.reasoning_summary,
+                structured_output_format=args.structured_output_format,
                 timeout_seconds=args.timeout_seconds,
                 max_context_tokens=args.max_context_tokens,
                 inherit_from_main=inherit_from_main,
@@ -627,7 +674,7 @@ def main(argv: Optional[list] = None) -> int:
 
         print("[%s]" % result["target"])
         print("Provider: %s" % result["provider_type"])
-        if args.target == "verification":
+        if args.target in {"verification", "archival"}:
             print("Inherit main provider: %s" % str(result["inherit_from_main"]).lower())
         print("Model/deployment: %s" % result["model"])
         print("Base URL/endpoint: %s" % result["base_url"])
@@ -636,6 +683,9 @@ def main(argv: Optional[list] = None) -> int:
             print("API version: %s" % result["api_version"])
         print("Stream: %s" % str(result["stream"]).lower())
         print("Temperature: %s" % result["temperature"])
+        print("Reasoning effort: %s" % result["reasoning_effort"])
+        print("Reasoning summary: %s" % result["reasoning_summary"])
+        print("Structured output format: %s" % result["structured_output_format"])
         print("Timeout seconds: %s" % result["timeout_seconds"])
         print("Max context tokens: %s" % resolve_model_context_window(result["model"], configured=result["max_context_tokens"]))
         print("Config: %s" % result["config_file"])

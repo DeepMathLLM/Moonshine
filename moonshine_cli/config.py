@@ -98,6 +98,9 @@ class ProviderConfig:
     api_version: str = str(_config_value("provider", "api_version"))
     timeout_seconds: int = int(_config_value("provider", "timeout_seconds"))
     temperature: Optional[float] = _optional_float(_config_value("provider", "temperature"))
+    reasoning_effort: str = str(_config_value("provider", "reasoning_effort"))
+    reasoning_summary: str = str(_config_value("provider", "reasoning_summary"))
+    structured_output_format: str = str(_config_value("provider", "structured_output_format"))
     stream: bool = bool(_config_value("provider", "stream"))
     max_retries: int = int(_config_value("provider", "max_retries"))
     retry_backoff_seconds: float = float(_config_value("provider", "retry_backoff_seconds"))
@@ -116,10 +119,34 @@ class VerificationProviderConfig:
     api_version: str = str(DEFAULT_CONFIG["verification_provider"]["api_version"])
     timeout_seconds: int = int(DEFAULT_CONFIG["verification_provider"]["timeout_seconds"])
     temperature: Optional[float] = _optional_float(DEFAULT_CONFIG["verification_provider"]["temperature"])
+    reasoning_effort: str = str(DEFAULT_CONFIG["verification_provider"]["reasoning_effort"])
+    reasoning_summary: str = str(DEFAULT_CONFIG["verification_provider"]["reasoning_summary"])
+    structured_output_format: str = str(DEFAULT_CONFIG["verification_provider"]["structured_output_format"])
     stream: bool = bool(DEFAULT_CONFIG["verification_provider"]["stream"])
     max_retries: int = int(DEFAULT_CONFIG["verification_provider"]["max_retries"])
     retry_backoff_seconds: float = float(DEFAULT_CONFIG["verification_provider"]["retry_backoff_seconds"])
     max_context_tokens: int = int(DEFAULT_CONFIG["verification_provider"]["max_context_tokens"])
+
+
+@dataclass
+class ArchivalProviderConfig:
+    """Dedicated research-archival provider configuration."""
+
+    inherit_from_main: bool = bool(DEFAULT_CONFIG["archival_provider"]["inherit_from_main"])
+    type: str = str(DEFAULT_CONFIG["archival_provider"]["type"])
+    model: str = str(DEFAULT_CONFIG["archival_provider"]["model"])
+    base_url: str = str(DEFAULT_CONFIG["archival_provider"]["base_url"])
+    api_key_env: str = str(DEFAULT_CONFIG["archival_provider"]["api_key_env"])
+    api_version: str = str(DEFAULT_CONFIG["archival_provider"]["api_version"])
+    timeout_seconds: int = int(DEFAULT_CONFIG["archival_provider"]["timeout_seconds"])
+    temperature: Optional[float] = _optional_float(DEFAULT_CONFIG["archival_provider"]["temperature"])
+    reasoning_effort: str = str(DEFAULT_CONFIG["archival_provider"]["reasoning_effort"])
+    reasoning_summary: str = str(DEFAULT_CONFIG["archival_provider"]["reasoning_summary"])
+    structured_output_format: str = str(DEFAULT_CONFIG["archival_provider"]["structured_output_format"])
+    stream: bool = bool(DEFAULT_CONFIG["archival_provider"]["stream"])
+    max_retries: int = int(DEFAULT_CONFIG["archival_provider"]["max_retries"])
+    retry_backoff_seconds: float = float(DEFAULT_CONFIG["archival_provider"]["retry_backoff_seconds"])
+    max_context_tokens: int = int(DEFAULT_CONFIG["archival_provider"]["max_context_tokens"])
 
 
 @dataclass
@@ -210,6 +237,7 @@ class AppConfig:
     default_project: str = str(DEFAULT_CONFIG["default_project"])
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     verification_provider: VerificationProviderConfig = field(default_factory=VerificationProviderConfig)
+    archival_provider: ArchivalProviderConfig = field(default_factory=ArchivalProviderConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     exposure: ExposureConfig = field(default_factory=ExposureConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -226,6 +254,7 @@ class AppConfig:
             default_project=payload.get("default_project", DEFAULT_CONFIG["default_project"]),
             provider=ProviderConfig(**dict(payload.get("provider", {}))),
             verification_provider=VerificationProviderConfig(**dict(payload.get("verification_provider", {}))),
+            archival_provider=ArchivalProviderConfig(**dict(payload.get("archival_provider", {}))),
             agent=AgentConfig(**dict(payload.get("agent", {}))),
             exposure=ExposureConfig(**dict(payload.get("exposure", {}))),
             memory=MemoryConfig(**dict(payload.get("memory", {}))),
@@ -257,6 +286,9 @@ def render_core_config_yaml(config: AppConfig) -> str:
         "  api_version: %s" % config.provider.api_version,
         "  timeout_seconds: %s" % config.provider.timeout_seconds,
         "  temperature: %s" % config.provider.temperature,
+        "  reasoning_effort: %s" % config.provider.reasoning_effort,
+        "  reasoning_summary: %s" % config.provider.reasoning_summary,
+        "  structured_output_format: %s" % config.provider.structured_output_format,
         "  stream: %s" % str(config.provider.stream).lower(),
         "  max_context_tokens: %s" % config.provider.max_context_tokens,
         "verification_provider:",
@@ -268,8 +300,25 @@ def render_core_config_yaml(config: AppConfig) -> str:
         "  api_version: %s" % config.verification_provider.api_version,
         "  timeout_seconds: %s" % config.verification_provider.timeout_seconds,
         "  temperature: %s" % config.verification_provider.temperature,
+        "  reasoning_effort: %s" % config.verification_provider.reasoning_effort,
+        "  reasoning_summary: %s" % config.verification_provider.reasoning_summary,
+        "  structured_output_format: %s" % config.verification_provider.structured_output_format,
         "  stream: %s" % str(config.verification_provider.stream).lower(),
         "  max_context_tokens: %s" % config.verification_provider.max_context_tokens,
+        "archival_provider:",
+        "  inherit_from_main: %s" % str(config.archival_provider.inherit_from_main).lower(),
+        "  type: %s" % config.archival_provider.type,
+        "  model: %s" % config.archival_provider.model,
+        "  base_url: %s" % config.archival_provider.base_url,
+        "  api_key_env: %s" % config.archival_provider.api_key_env,
+        "  api_version: %s" % config.archival_provider.api_version,
+        "  timeout_seconds: %s" % config.archival_provider.timeout_seconds,
+        "  temperature: %s" % config.archival_provider.temperature,
+        "  reasoning_effort: %s" % config.archival_provider.reasoning_effort,
+        "  reasoning_summary: %s" % config.archival_provider.reasoning_summary,
+        "  structured_output_format: %s" % config.archival_provider.structured_output_format,
+        "  stream: %s" % str(config.archival_provider.stream).lower(),
+        "  max_context_tokens: %s" % config.archival_provider.max_context_tokens,
         "agent:",
         "  max_model_rounds: %s" % config.agent.max_model_rounds,
         "  max_tool_rounds: %s" % config.agent.max_tool_rounds,
