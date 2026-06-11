@@ -2,7 +2,7 @@
 {
   "name": "query_memory",
   "handler": "query_memory",
-  "description": "Retrieve relevant memory on demand. In research mode project research memory is stored only in research_log.jsonl and searched through research_log_index.sqlite, so retrieval returns project-memory records and direct content excerpts with source references.",
+  "description": "Retrieve relevant memory on demand. Searches project research logs, unified session records, dynamic memory, and knowledge records from original stored content and returns source-linked results.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -61,7 +61,7 @@
       },
       "prefer_raw": {
         "type": "boolean",
-        "description": "When true, prefer original windows and direct excerpts over extra summarization. Research mode turns this on by default."
+        "description": "Compatibility flag. Current retrieval favors original stored content and local context rather than summary-only results."
       }
     },
     "required": ["query"]
@@ -72,6 +72,6 @@
 # Tool: query_memory
 
 ## Usage Hint
-- Use this tool to retrieve project memory, research-log records, by-type memory files, knowledge, or session snippets.
-- Use it when prior research progress may contain facts, failed paths, verified conclusions, or decisions relevant to the current step.
+- Use this as the default retrieval tool for relevant prior work from project research logs, unified session records, dynamic memory, and knowledge records.
+- Use it when prior facts, failed paths, verified conclusions, decisions, examples, or tool-supported observations may affect the current step.
 
