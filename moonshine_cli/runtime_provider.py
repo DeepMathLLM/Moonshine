@@ -35,6 +35,7 @@ def _resolve_provider_settings(provider_config) -> BaseProvider:
             max_retries=provider_config.max_retries,
             retry_backoff_seconds=provider_config.retry_backoff_seconds,
             max_context_tokens=max_context_tokens,
+            structured_output_format=getattr(provider_config, "structured_output_format", "json_schema"),
         )
     if provider_type in {"azure_openai", "azure", "azure_chat_completions"}:
         return AzureOpenAIChatCompletionsProvider(
@@ -49,6 +50,7 @@ def _resolve_provider_settings(provider_config) -> BaseProvider:
             max_retries=provider_config.max_retries,
             retry_backoff_seconds=provider_config.retry_backoff_seconds,
             max_context_tokens=max_context_tokens,
+            structured_output_format=getattr(provider_config, "structured_output_format", "json_schema"),
         )
     if provider_type in {"openai_responses", "responses"}:
         return OpenAIResponsesProvider(
