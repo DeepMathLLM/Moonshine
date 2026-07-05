@@ -139,6 +139,7 @@ class MoonshineApp(object):
         self.provider = resolve_runtime_provider(self.config)
         self.verification_provider = resolve_verification_provider(self.config, fallback_provider=self.provider)
         self.archival_provider = resolve_archival_provider(self.config, fallback_provider=self.provider)
+        self._attach_provider_config_callbacks()
         self.research_project_resolver = ResearchProjectResolver(paths=self.paths, provider=self.provider)
         self.memory = MemoryManager(
             self.paths,
@@ -177,6 +178,7 @@ class MoonshineApp(object):
         self.provider = resolve_runtime_provider(self.config)
         self.verification_provider = resolve_verification_provider(self.config, fallback_provider=self.provider)
         self.archival_provider = resolve_archival_provider(self.config, fallback_provider=self.provider)
+        self._attach_provider_config_callbacks()
         self.research_project_resolver.provider = self.provider
         self.memory.set_provider(self.provider)
         self.context_manager.provider = self.provider
@@ -184,6 +186,47 @@ class MoonshineApp(object):
         self.agent.verification_provider = self.verification_provider
         self.agent.archival_provider = self.archival_provider
         self.agent.research_workflow.provider = self.archival_provider
+
+    def _provider_config_for_target(self, target: str):
+        """Return the mutable provider config object for one provider target."""
+        normalized = str(target or "main").strip().lower()
+        if normalized == "verification":
+            return self.config.verification_provider
+        if normalized == "archival":
+            return self.config.archival_provider
+        return self.config.provider
+
+    def _persist_structured_output_format(self, target: str, format_name: str) -> None:
+        """Persist a structured-output format that succeeded after provider fallback."""
+        normalized = str(format_name or "").strip().lower()
+        if normalized not in {"json_schema", "json_object", "prompt"}:
+            return
+        provider_config = self._provider_config_for_target(target)
+        if str(getattr(provider_config, "structured_output_format", "") or "").strip().lower() == normalized:
+            return
+        provider_config.structured_output_format = normalized
+        save_config(self.paths, self.config)
+
+    def _attach_provider_config_callbacks(self) -> None:
+        """Attach lightweight config persistence callbacks to runtime providers."""
+        attached_ids = set()
+
+        def attach(provider, target: str) -> None:
+            if provider is None or id(provider) in attached_ids:
+                return
+            attached_ids.add(id(provider))
+            try:
+                provider.structured_output_format_callback = (
+                    lambda format_name, provider_target=target: self._persist_structured_output_format(provider_target, format_name)
+                )
+            except Exception:
+                pass
+
+        attach(self.provider, "main")
+        if self.verification_provider is not self.provider:
+            attach(self.verification_provider, "verification")
+        if self.archival_provider is not self.provider and self.archival_provider is not self.verification_provider:
+            attach(self.archival_provider, "archival")
 
     def startup_notices(self) -> list:
         """Return non-blocking startup notices for optional integrations."""

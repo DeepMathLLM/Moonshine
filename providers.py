@@ -8,7 +8,7 @@ import time
 from urllib.parse import quote
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from moonshine.agent_runtime.model_metadata import DEFAULT_CONTEXT_WINDOW_TOKENS
 from moonshine.json_schema import JsonSchemaValidationError, validate_json_schema
@@ -311,6 +311,8 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
         max_context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+        structured_output_format: str = "json_schema",
+        structured_output_format_callback: Optional[Callable[[str], None]] = None,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -322,6 +324,10 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.max_context_tokens = max(1024, int(max_context_tokens))
+        self.structured_output_format = str(structured_output_format or "json_schema").strip().lower()
+        if self.structured_output_format not in {"auto", "json_schema", "json_object", "prompt"}:
+            self.structured_output_format = "json_schema"
+        self.structured_output_format_callback = structured_output_format_callback
 
     def _fallback(self, note: str) -> OfflineProvider:
         """Create an offline fallback provider."""
@@ -379,6 +385,59 @@ class OpenAIChatCompletionsProvider(BaseProvider):
             json.dumps(response_schema, ensure_ascii=False, indent=2, sort_keys=True),
         )
 
+    def _structured_format_attempt_order(self) -> List[str]:
+        """Return structured-output formats to try, beginning with the configured mode."""
+        mode = str(self.structured_output_format or "json_schema").strip().lower()
+        if mode == "json_object":
+            return ["json_object", "json_schema", "prompt"]
+        if mode == "prompt":
+            return ["prompt"]
+        return ["json_schema", "json_object", "prompt"]
+
+    def _build_structured_payload_for_format(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[Dict[str, str]],
+        response_schema: Dict[str, object],
+        schema_name: str,
+        format_name: str,
+    ) -> Dict[str, object]:
+        """Build a structured chat-completions payload for one output format."""
+        response_format = None
+        prompt = system_prompt
+        if format_name == "json_schema":
+            response_format = self._json_schema_response_format(
+                schema_name=schema_name,
+                response_schema=response_schema,
+            )
+        elif format_name == "json_object":
+            response_format = self._json_object_response_format()
+            prompt = system_prompt + self._json_object_format_instruction(schema_name, response_schema)
+        elif format_name == "prompt":
+            prompt = system_prompt + self._json_object_format_instruction(schema_name, response_schema)
+        else:
+            response_format = self._json_schema_response_format(
+                schema_name=schema_name,
+                response_schema=response_schema,
+            )
+        return self._build_payload(
+            system_prompt=prompt,
+            messages=messages,
+            tool_schemas=[],
+            response_format=response_format,
+        )
+
+    def _set_successful_structured_output_format(self, format_name: str) -> None:
+        """Remember a fallback format once a structured call succeeds."""
+        normalized = str(format_name or "").strip().lower()
+        if normalized not in {"json_schema", "json_object", "prompt"}:
+            return
+        self.structured_output_format = normalized
+        callback = getattr(self, "structured_output_format_callback", None)
+        if callback:
+            callback(normalized)
+
     def _retry_payload_with_json_object(
         self,
         payload: Dict[str, object],
@@ -408,21 +467,33 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         retry_payload["messages"] = messages
         return retry_payload
 
-    def _should_retry_with_json_object_response_format(self, exc: Exception) -> bool:
-        """Return True when a compatible API rejects JSON-schema response_format."""
+    def _should_retry_with_alternate_response_format(self, exc: Exception) -> bool:
+        """Return True when a compatible API rejects the current structured format."""
         if not isinstance(exc, HTTPError) or getattr(exc, "code", None) != 400:
             return False
         lowered = _read_http_error_body(exc).lower()
-        return (
+        mentions_structured_format = (
             "response_format" in lowered
-            and (
-                "unavailable" in lowered
-                or "json_schema" in lowered
-                or "unsupported" in lowered
-                or "not support" in lowered
-                or "does not support" in lowered
-            )
+            or "json_schema" in lowered
+            or "json_object" in lowered
+            or "text.format" in lowered
         )
+        mentions_incompatibility = (
+            "unavailable" in lowered
+            or "unsupported" in lowered
+            or "unknown parameter" in lowered
+            or "invalid" in lowered
+            or "not support" in lowered
+            or "does not support" in lowered
+        )
+        return (
+            mentions_structured_format
+            and mentions_incompatibility
+        )
+
+    def _should_retry_with_json_object_response_format(self, exc: Exception) -> bool:
+        """Backward-compatible wrapper for older tests and callers."""
+        return self._should_retry_with_alternate_response_format(exc)
 
     def _parse_structured_payload(self, parsed_payload: Dict[str, object], response_schema: Dict[str, object]) -> Dict[str, object]:
         """Parse and locally validate a structured chat-completions response."""
@@ -616,31 +687,44 @@ class OpenAIChatCompletionsProvider(BaseProvider):
         if Request is None or urlopen is None:
             raise RuntimeError("urllib request support is unavailable")
 
-        payload = self._build_payload(
+        format_order = self._structured_format_attempt_order()
+        format_index = 0
+        format_name = format_order[format_index]
+        initial_format_name = format_name
+        payload = self._build_structured_payload_for_format(
             system_prompt=system_prompt,
             messages=messages,
-            tool_schemas=[],
-            response_format=self._json_schema_response_format(schema_name=schema_name, response_schema=response_schema),
+            response_schema=response_schema,
+            schema_name=schema_name,
+            format_name=format_name,
         )
         attempts_remaining = self.max_retries + 1
-        retried_with_json_object = False
         last_exc = None
         while attempts_remaining > 0:
             try:
                 request = self._make_request(payload, api_key)
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     parsed_payload = json.loads(response.read().decode("utf-8"))
-                return self._parse_structured_payload(parsed_payload, response_schema)
-            except (HTTPError, URLError, KeyError, IndexError, ValueError) as exc:
+                result = self._parse_structured_payload(parsed_payload, response_schema)
+                if format_name != initial_format_name or self.structured_output_format not in {"auto", format_name}:
+                    self._set_successful_structured_output_format(format_name)
+                return result
+            except (HTTPError, URLError, KeyError, IndexError, ValueError, JsonSchemaValidationError) as exc:
                 last_exc = exc
                 attempts_remaining -= 1
-                if (not retried_with_json_object) and self._should_retry_with_json_object_response_format(exc):
-                    payload = self._retry_payload_with_json_object(
-                        payload,
-                        schema_name=schema_name,
+                if (
+                    self._should_retry_with_alternate_response_format(exc)
+                    and format_index + 1 < len(format_order)
+                ):
+                    format_index += 1
+                    format_name = format_order[format_index]
+                    payload = self._build_structured_payload_for_format(
+                        system_prompt=system_prompt,
+                        messages=messages,
                         response_schema=response_schema,
+                        schema_name=schema_name,
+                        format_name=format_name,
                     )
-                    retried_with_json_object = True
                     if attempts_remaining <= 0:
                         attempts_remaining = 1
                     continue
@@ -666,6 +750,8 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
         max_context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+        structured_output_format: str = "json_schema",
+        structured_output_format_callback: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(
             model=model,
@@ -678,6 +764,8 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             max_context_tokens=max_context_tokens,
+            structured_output_format=structured_output_format,
+            structured_output_format_callback=structured_output_format_callback,
         )
         self.api_version = (api_version or "2024-12-01-preview").strip()
 
@@ -769,32 +857,45 @@ class AzureOpenAIChatCompletionsProvider(OpenAIChatCompletionsProvider):
         if Request is None or urlopen is None:
             raise RuntimeError("urllib request support is unavailable")
 
-        payload = self._build_payload(
+        format_order = self._structured_format_attempt_order()
+        format_index = 0
+        format_name = format_order[format_index]
+        initial_format_name = format_name
+        payload = self._build_structured_payload_for_format(
             system_prompt=system_prompt,
             messages=messages,
-            tool_schemas=[],
-            response_format=self._json_schema_response_format(schema_name=schema_name, response_schema=response_schema),
+            response_schema=response_schema,
+            schema_name=schema_name,
+            format_name=format_name,
         )
         attempts_remaining = self.max_retries + 1
         retried_without_temperature = False
-        retried_with_json_object = False
         last_exc = None
         while attempts_remaining > 0:
             try:
                 request = self._make_request(payload, api_key)
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     parsed_payload = json.loads(response.read().decode("utf-8"))
-                return self._parse_structured_payload(parsed_payload, response_schema)
-            except (HTTPError, URLError, KeyError, IndexError, ValueError) as exc:
+                result = self._parse_structured_payload(parsed_payload, response_schema)
+                if format_name != initial_format_name or self.structured_output_format not in {"auto", format_name}:
+                    self._set_successful_structured_output_format(format_name)
+                return result
+            except (HTTPError, URLError, KeyError, IndexError, ValueError, JsonSchemaValidationError) as exc:
                 last_exc = exc
                 attempts_remaining -= 1
-                if (not retried_with_json_object) and self._should_retry_with_json_object_response_format(exc):
-                    payload = self._retry_payload_with_json_object(
-                        payload,
-                        schema_name=schema_name,
+                if (
+                    self._should_retry_with_alternate_response_format(exc)
+                    and format_index + 1 < len(format_order)
+                ):
+                    format_index += 1
+                    format_name = format_order[format_index]
+                    payload = self._build_structured_payload_for_format(
+                        system_prompt=system_prompt,
+                        messages=messages,
                         response_schema=response_schema,
+                        schema_name=schema_name,
+                        format_name=format_name,
                     )
-                    retried_with_json_object = True
                     if attempts_remaining <= 0:
                         attempts_remaining = 1
                     continue
@@ -928,6 +1029,7 @@ class OpenAIResponsesProvider(BaseProvider):
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.0,
         max_context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+        structured_output_format_callback: Optional[Callable[[str], None]] = None,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -941,6 +1043,7 @@ class OpenAIResponsesProvider(BaseProvider):
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.max_context_tokens = max(1024, int(max_context_tokens))
+        self.structured_output_format_callback = structured_output_format_callback
 
     def _fallback(self, note: str) -> OfflineProvider:
         return OfflineProvider(note=note)
@@ -1052,15 +1155,39 @@ class OpenAIResponsesProvider(BaseProvider):
     def _json_object_text_format(self) -> Dict[str, object]:
         return {"type": "json_object"}
 
-    def _initial_structured_text_format(self, *, schema_name: str, response_schema: Dict[str, object]) -> Optional[Dict[str, object]]:
-        mode = self.structured_output_format
-        if mode in {"auto", "json_schema"}:
-            return self._json_schema_text_format(schema_name=schema_name, response_schema=response_schema)
+    def _structured_format_attempt_order(self) -> List[str]:
+        mode = str(self.structured_output_format or "json_schema").strip().lower()
         if mode == "json_object":
-            return self._json_object_text_format()
+            return ["json_object", "json_schema", "prompt"]
         if mode == "prompt":
+            return ["prompt"]
+        return ["json_schema", "json_object", "prompt"]
+
+    def _structured_text_format_for_name(self, *, schema_name: str, response_schema: Dict[str, object], format_name: str) -> Optional[Dict[str, object]]:
+        if format_name == "json_schema":
+            return self._json_schema_text_format(schema_name=schema_name, response_schema=response_schema)
+        if format_name == "json_object":
+            return self._json_object_text_format()
+        if format_name == "prompt":
             return None
         return self._json_schema_text_format(schema_name=schema_name, response_schema=response_schema)
+
+    def _initial_structured_text_format(self, *, schema_name: str, response_schema: Dict[str, object]) -> Optional[Dict[str, object]]:
+        format_name = self._structured_format_attempt_order()[0]
+        return self._structured_text_format_for_name(
+            schema_name=schema_name,
+            response_schema=response_schema,
+            format_name=format_name,
+        )
+
+    def _set_successful_structured_output_format(self, format_name: str) -> None:
+        normalized = str(format_name or "").strip().lower()
+        if normalized not in {"json_schema", "json_object", "prompt"}:
+            return
+        self.structured_output_format = normalized
+        callback = getattr(self, "structured_output_format_callback", None)
+        if callback:
+            callback(normalized)
 
     def _should_retry_with_json_object_text_format(self, exc: Exception) -> bool:
         lowered = _format_provider_exception(exc).lower()
@@ -1068,12 +1195,15 @@ class OpenAIResponsesProvider(BaseProvider):
             "text.format" in lowered
             or "response_format" in lowered
             or "json_schema" in lowered
+            or "json_object" in lowered
             or "schema" in lowered
             or "strict" in lowered
             or "unknown parameter" in lowered
             or "invalid_request" in lowered
             or "unavailable" in lowered
             or "unsupported" in lowered
+            or "not support" in lowered
+            or "does not support" in lowered
         )
 
     def _should_retry_without_text_format(self, exc: Exception) -> bool:
@@ -1086,6 +1216,8 @@ class OpenAIResponsesProvider(BaseProvider):
             or "invalid_request" in lowered
             or "unavailable" in lowered
             or "unsupported" in lowered
+            or "not support" in lowered
+            or "does not support" in lowered
         )
 
     def _make_request(self, payload: Dict[str, object], api_key: str) -> Request:
@@ -1313,15 +1445,20 @@ class OpenAIResponsesProvider(BaseProvider):
         if Request is None or urlopen is None:
             raise RuntimeError("structured responses call failed: urllib request support is unavailable")
 
+        format_order = self._structured_format_attempt_order()
+        format_index = 0
+        format_name = format_order[format_index]
+        initial_format_name = format_name
         payload = self._build_payload(
             system_prompt=prompt,
             messages=messages,
             tool_schemas=None,
-            text_format=self._initial_structured_text_format(schema_name=schema_name, response_schema=response_schema),
+            text_format=self._structured_text_format_for_name(
+                schema_name=schema_name,
+                response_schema=response_schema,
+                format_name=format_name,
+            ),
         )
-        initial_text_format = payload.get("text", {}).get("format") if isinstance(payload.get("text"), dict) else None
-        retried_with_json_object = bool(isinstance(initial_text_format, dict) and initial_text_format.get("type") == "json_object")
-        retried_without_text_format = not bool(initial_text_format)
         attempts_remaining = self.max_retries
         last_exc = None
         while True:
@@ -1331,23 +1468,28 @@ class OpenAIResponsesProvider(BaseProvider):
                     parsed_response = json.loads(response.read().decode("utf-8"))
                 response = self._response_from_payload(parsed_response)
                 parsed = _parse_json_object_from_text(response.content)
-                return _coerce_structured_payload(parsed, response_schema)
+                result = _coerce_structured_payload(parsed, response_schema)
+                if format_name != initial_format_name or self.structured_output_format not in {"auto", format_name}:
+                    self._set_successful_structured_output_format(format_name)
+                return result
             except (HTTPError, URLError, KeyError, IndexError, ValueError, JsonSchemaValidationError) as exc:
                 last_exc = exc
-                if (not retried_with_json_object) and self._should_retry_with_json_object_text_format(exc):
+                if (
+                    self._should_retry_with_json_object_text_format(exc)
+                    and format_index + 1 < len(format_order)
+                ):
+                    format_index += 1
+                    format_name = format_order[format_index]
                     payload = self._build_payload(
                         system_prompt=prompt,
                         messages=messages,
                         tool_schemas=None,
-                        text_format=self._json_object_text_format(),
+                        text_format=self._structured_text_format_for_name(
+                            schema_name=schema_name,
+                            response_schema=response_schema,
+                            format_name=format_name,
+                        ),
                     )
-                    retried_with_json_object = True
-                    if attempts_remaining <= 0:
-                        attempts_remaining = 1
-                    continue
-                if (not retried_without_text_format) and self._should_retry_without_text_format(exc):
-                    payload = self._build_payload(system_prompt=prompt, messages=messages, tool_schemas=None)
-                    retried_without_text_format = True
                     if attempts_remaining <= 0:
                         attempts_remaining = 1
                     continue
