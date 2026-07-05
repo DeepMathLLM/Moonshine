@@ -504,6 +504,7 @@ def main(argv: Optional[list] = None) -> int:
                 bool(args.type),
                 bool(args.azure_openai),
                 bool(args.openai_compatible),
+                bool(args.openai_responses),
                 args.endpoint is not None,
                 args.base_url is not None,
                 args.deployment is not None,
