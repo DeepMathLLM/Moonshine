@@ -17,6 +17,7 @@ def build_system_prompt(
     skill_index: Optional[str] = None,
     agent_summary: Optional[str] = None,
     agent_body: Optional[str] = None,
+    agent_slug: Optional[str] = None,
     mcp_index: Optional[str] = None,
     research_runtime_context: Optional[str] = None,
 ) -> str:
@@ -37,7 +38,7 @@ def build_system_prompt(
         )
     if mode == "research":
         lines.append("")
-        lines.append(build_research_mode_policy(project_slug))
+        lines.append(build_research_mode_policy(project_slug, agent_slug=agent_slug or ""))
         lines.append("")
         lines.append(
             "Research skill/tool contract: actively match the current research step to the available skill and tool indexes. "

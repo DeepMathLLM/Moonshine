@@ -15,6 +15,7 @@ from moonshine.agent_runtime.research_log import (
     RESEARCH_ARCHIVE_SCHEMA,
     RESEARCH_LOG_TYPES,
     ResearchLogStore,
+    normalize_research_log_type,
     render_research_log_for_archive,
 )
 from moonshine.json_schema import validate_json_schema
@@ -34,6 +35,7 @@ from moonshine.utils import (
     read_text,
     shorten,
     split_text_by_token_budget,
+    slugify,
     trim_text_to_token_budget,
     utc_now,
 )
@@ -42,6 +44,22 @@ from moonshine.utils import (
 WORKFLOW_VERSION = 3
 RESEARCH_COMPRESSION_INPUT_TOKEN_BUDGET = 500000
 RESEARCH_ARCHIVE_INPUT_TOKEN_BUDGET = 100000
+
+RESEARCH_FINAL_REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "A concise title for the generated research report.",
+        },
+        "report_markdown": {
+            "type": "string",
+            "description": "The complete Markdown research report.",
+        },
+    },
+    "required": ["title", "report_markdown"],
+    "additionalProperties": False,
+}
 
 RESEARCH_STAGES = ["problem_design", "problem_solving"]
 
@@ -1879,7 +1897,7 @@ class ResearchWorkflowManager(object):
             "problem": "researched problems, candidate problems, problem revisions, and final problem statements",
             "verified_conclusion": "verified conclusions, including verified intermediate conclusions",
             "verification": "verification processes, verdicts, gaps, passes, and failures",
-            "final_result": "final results, final theorems, and final answers",
+            "project_result": "project-level results, final theorems, and final answers",
             "counterexample": "counterexamples or constructions that refute a claim",
             "failed_path": "failed routes or methods, whether or not a counterexample was also found",
             "research_note": "all other useful research progress, calculations, plans, attempts, and observations",
@@ -4066,6 +4084,304 @@ class ResearchWorkflowManager(object):
             int(getattr(getattr(self.config, "context", None), "compression_threshold_tokens", 200000) or 200000),
         )
 
+    def _offset_value(self, offsets: Dict[str, object], key: str) -> int:
+        """Read a nonnegative integer offset."""
+        try:
+            return max(0, int(dict(offsets or {}).get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _runtime_relative_path(self, path: Path) -> str:
+        """Return a runtime-home-relative path when possible."""
+        try:
+            return path.relative_to(self.paths.home).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def _latest_project_report_path(self, project_slug: str) -> Optional[Path]:
+        """Return the latest generated project report, if one exists."""
+        reports_dir = self.paths.project_reports_dir(project_slug)
+        if not reports_dir.exists():
+            return None
+        files = [path for path in reports_dir.glob("*.md") if path.is_file()]
+        if not files:
+            return None
+        files.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        return files[0]
+
+    def _unique_project_report_path(self, project_slug: str, title: str) -> Path:
+        """Return a unique report path based on timestamp and title."""
+        reports_dir = self.paths.project_reports_dir(project_slug)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = utc_now().replace(":", "-").replace("T", "_")
+        slug = slugify(title or "research-report", prefix="report")
+        candidate = reports_dir / ("%s_%s.md" % (timestamp, slug))
+        suffix = 2
+        while candidate.exists():
+            candidate = reports_dir / ("%s_%s-%s.md" % (timestamp, slug, suffix))
+            suffix += 1
+        return candidate
+
+    def _jsonl_slice(self, path: Path, offset: int) -> List[Dict[str, object]]:
+        """Return JSONL records from a zero-based offset."""
+        rows = [dict(item) for item in read_jsonl(path) if isinstance(item, dict)]
+        return rows[min(max(0, int(offset or 0)), len(rows)) :]
+
+    def _message_text_for_report(self, item: Dict[str, object]) -> str:
+        """Render one stored message for final report generation."""
+        role = str(item.get("role") or "message")
+        created_at = str(item.get("created_at") or "")
+        message_id = str(item.get("id") or "")
+        metadata = dict(item.get("metadata") or {})
+        content = str(item.get("content") or "").strip()
+        reasoning_content = str(metadata.get("reasoning_content") or "").strip()
+        if role == "assistant" and reasoning_content:
+            content = "[reasoning]\n%s\n[/reasoning]\n\n%s" % (reasoning_content, content)
+        return "## Message %s (%s)\nCreated at: %s\n\n%s" % (message_id or "?", role, created_at, content)
+
+    def _render_messages_for_report(self, rows: Sequence[Dict[str, object]]) -> str:
+        """Render session messages for final report generation."""
+        rendered = [self._message_text_for_report(dict(item)) for item in list(rows or []) if isinstance(item, dict)]
+        return "\n\n".join(part.strip() for part in rendered if part.strip()) or "(none)"
+
+    def _render_tool_event_summary_for_report(self, rows: Sequence[Dict[str, object]]) -> str:
+        """Render a compact list of current-run tool events."""
+        lines = []
+        for index, item in enumerate(list(rows or []), start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "%s. %s | call_id=%s | status=%s | created_at=%s | archive=%s"
+                % (
+                    index,
+                    str(item.get("tool") or ""),
+                    str(item.get("call_id") or ""),
+                    "error" if item.get("error") else "ok",
+                    str(item.get("created_at") or ""),
+                    str(item.get("archive_path") or ""),
+                )
+            )
+        return "\n".join(lines) or "(none)"
+
+    def _important_report_tool_events(self, rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        """Return complete non-final tool events important for final report writing."""
+        important_tools = {
+            "assess_problem_quality",
+            "pessimistic_verify",
+            "verify_overall",
+            "verify_correctness_assumption",
+            "verify_correctness_computation",
+            "verify_correctness_logic",
+        }
+        selected = []
+        for item in list(rows or []):
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool") or "").strip()
+            if tool_name == "verify_overall":
+                arguments = dict(item.get("arguments") or {})
+                output = dict(item.get("output") or {})
+                scope = str(output.get("scope") or arguments.get("scope") or "").strip().lower()
+                if scope == "final":
+                    continue
+            if tool_name in important_tools or tool_name.startswith("verify_"):
+                selected.append(dict(item))
+        return selected
+
+    def _final_verification_events(self, rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        """Return complete final verify_overall events from the current report window."""
+        selected = []
+        for item in list(rows or []):
+            if not isinstance(item, dict) or str(item.get("tool") or "") != "verify_overall":
+                continue
+            arguments = dict(item.get("arguments") or {})
+            output = dict(item.get("output") or {})
+            scope = str(output.get("scope") or arguments.get("scope") or "").strip().lower()
+            if scope == "final":
+                selected.append(dict(item))
+        return selected
+
+    def _render_json_block(self, value: object) -> str:
+        """Render a JSON value in a fenced block."""
+        return "```json\n%s\n```" % json.dumps(value, ensure_ascii=False, indent=2)
+
+    def _report_session_windows(self, offsets: Dict[str, object], session_id: str) -> List[Dict[str, object]]:
+        """Return session-specific windows that should feed one project-level report."""
+        windows = []
+        for item in list(dict(offsets or {}).get("pending_sessions") or []):
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("session_id") or "").strip()
+            if not sid:
+                continue
+            windows.append(
+                {
+                    "session_id": sid,
+                    "messages": self._offset_value(item, "messages"),
+                    "tool_events": self._offset_value(item, "tool_events"),
+                }
+            )
+        if windows:
+            return windows
+        return [
+            {
+                "session_id": session_id,
+                "messages": self._offset_value(offsets, "messages"),
+                "tool_events": self._offset_value(offsets, "tool_events"),
+            }
+        ]
+
+    def _build_final_report_prompt(
+        self,
+        *,
+        project_slug: str,
+        session_id: str,
+        offsets: Dict[str, object],
+    ) -> str:
+        """Build the final-report generation prompt from durable run records."""
+        previous_report_path = self._latest_project_report_path(project_slug)
+        previous_report = read_text(previous_report_path, default="").strip() if previous_report_path else ""
+        research_log_rows = self.research_log.records(project_slug)[self._offset_value(offsets, "research_log") :]
+        session_windows = self._report_session_windows(offsets, session_id)
+        message_sections = []
+        tool_summary_sections = []
+        all_tool_rows: List[Dict[str, object]] = []
+        source_sessions = []
+        for window in session_windows:
+            sid = str(window.get("session_id") or "").strip()
+            if not sid:
+                continue
+            message_rows = self._jsonl_slice(self.paths.session_messages_file(sid), self._offset_value(window, "messages"))
+            if self.session_store is not None:
+                tool_rows = list(self.session_store.get_tool_events(sid))[self._offset_value(window, "tool_events") :]
+            else:
+                tool_rows = self._jsonl_slice(self.paths.session_tool_events_file(sid), self._offset_value(window, "tool_events"))
+            all_tool_rows.extend(dict(item) for item in tool_rows if isinstance(item, dict))
+            message_sections.append("## Session %s\n\n%s" % (sid, self._render_messages_for_report(message_rows)))
+            tool_summary_sections.append("## Session %s\n\n%s" % (sid, self._render_tool_event_summary_for_report(tool_rows)))
+            source_sessions.append(
+                {
+                    "session_id": sid,
+                    "messages": self._runtime_relative_path(self.paths.session_messages_file(sid)),
+                    "tool_events": self._runtime_relative_path(self.paths.session_tool_events_file(sid)),
+                }
+            )
+        important_tool_rows = self._important_report_tool_events(all_tool_rows)
+        final_verification_rows = self._final_verification_events(all_tool_rows)
+        source_paths = {
+            "previous_report": self._runtime_relative_path(previous_report_path) if previous_report_path else "",
+            "sessions": source_sessions,
+            "research_log": self._runtime_relative_path(self.paths.project_research_log_file(project_slug)),
+        }
+        return (
+            "Use the following durable records to generate the final research report requested by the system prompt.\n"
+            "These sections are source material only; follow the system prompt for all report-writing requirements.\n\n"
+            "Project: %s\nSession: %s\nSource paths:\n%s\n\n"
+            "Previous research report:\n%s\n\n"
+            "Current-run research_log records:\n%s\n\n"
+            "Current-run session messages:\n%s\n\n"
+            "Current-run tool event summary:\n%s\n\n"
+            "Complete important non-final tool events, especially quality checks and intermediate verification:\n%s\n\n"
+            "Complete final verify_overall(scope=\"final\") events:\n%s"
+        ) % (
+            project_slug,
+            session_id,
+            json.dumps(source_paths, ensure_ascii=False, indent=2),
+            previous_report or "(none)",
+            render_research_log_for_archive(research_log_rows) or "(none)",
+            "\n\n".join(part.strip() for part in message_sections if part.strip()) or "(none)",
+            "\n\n".join(part.strip() for part in tool_summary_sections if part.strip()) or "(none)",
+            self._render_json_block(important_tool_rows),
+            self._render_json_block(final_verification_rows),
+        )
+
+    def _final_report_system_prompt(self) -> str:
+        """Return the instruction prompt for final research report generation."""
+        return (
+            "You write final Moonshine research reports from durable records.\n"
+            "Return only the structured JSON object requested by the schema, with fields title and report_markdown.\n"
+            "The report_markdown must read like a professional mathematical research report, not a chronological run log, chat transcript, audit dump, or high-level summary. "
+            "Choose the report structure naturally from the mathematical content in the records; do not force a fixed template.\n"
+            "Use only the supplied records. Do not add mathematical claims, proof steps, citations, computations, or limitations that are not present in the records.\n"
+            "Begin report_markdown with a concise summary of all prior research progress represented by the previous research report when one is supplied. "
+            "This opening summary must be clear, professionally structured, and substantive enough that a reader can understand the prior research progress before reading the new results from the current run. "
+            "If no previous research report is supplied, begin directly with the present report's mathematical orientation.\n"
+            "After the opening prior-progress summary, focus on the new progress produced in the current run.\n"
+            "Mathematical statements and proofs must be professional and complete according to the supplied records. "
+            "Preserve exact hypotheses, definitions, notation, constructions, counterexamples, verified intermediate conclusions, project-level results, limitations, and open conditions when they materially affect the report.\n"
+            "When a verification tool event contains the full claim/proof submitted for review, treat that payload as the authoritative source for the checked statement and proof. "
+            "Reproduce and organize recorded proofs faithfully rather than replacing them with vague summaries.\n"
+            "Use session messages to recover mathematical content that is not fully captured by research_log records or tool payloads.\n"
+            "Do not include raw audit metadata unless it is needed for mathematical traceability. Do not mention internal archiving mechanics."
+        )
+
+    def generate_final_report(
+        self,
+        *,
+        project_slug: str,
+        session_id: str,
+        offsets: Dict[str, object],
+        retries: int = 3,
+    ) -> Dict[str, object]:
+        """Generate a standalone research report after final verification passes."""
+        if self.provider is None or isinstance(self.provider, OfflineProvider) or not hasattr(self.provider, "generate_structured"):
+            return {"written": False, "skipped": "structured_provider_unavailable"}
+        attempts = max(1, int(retries or 3))
+        prompt = self._build_final_report_prompt(
+            project_slug=project_slug,
+            session_id=session_id,
+            offsets=dict(offsets or {}),
+        )
+        system_prompt = self._final_report_system_prompt()
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                payload = self.provider.generate_structured(
+                    system_prompt=system_prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_schema=RESEARCH_FINAL_REPORT_SCHEMA,
+                    schema_name="research_final_report",
+                )
+                validate_json_schema(payload, RESEARCH_FINAL_REPORT_SCHEMA)
+                title = str(payload.get("title") or "Research Report").strip() or "Research Report"
+                report_markdown = str(payload.get("report_markdown") or "").strip()
+                if not report_markdown:
+                    raise ValueError("empty report_markdown")
+                report_path = self._unique_project_report_path(project_slug, title)
+                atomic_write(report_path, report_markdown.rstrip() + "\n")
+                if self.session_store is not None and session_id:
+                    try:
+                        self.session_store.append_provider_round(
+                            session_id,
+                            {
+                                "created_at": utc_now(),
+                                "phase": "report",
+                                "title": "Final Research Report",
+                                "model_round": 0,
+                                "system_prompt": system_prompt,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "tool_schema_names": [],
+                                "response": {"content": json.dumps(payload, ensure_ascii=False), "tool_calls": []},
+                            },
+                        )
+                    except Exception:
+                        pass
+                return {
+                    "written": True,
+                    "title": title,
+                    "report_path": self._runtime_relative_path(report_path),
+                    "attempts": attempt,
+                    "source_offsets": dict(offsets or {}),
+                }
+            except Exception as exc:
+                last_error = str(exc)
+        return {
+            "written": False,
+            "error": last_error or "unknown final report generation failure",
+            "attempts": attempts,
+            "source_offsets": dict(offsets or {}),
+        }
+
     def _archive_research_turn(
         self,
         *,
@@ -4113,13 +4429,18 @@ class ResearchWorkflowManager(object):
         )
         type_contract = (
             "Allowed research-log types and their exclusive meanings:\n"
-            "- problem: The research object itself: researched problems, candidate problems, problem revisions, or final problem statements.\n"
-            "- verified_conclusion: A reusable mathematical result that has passed verification, including verified intermediate lemmas/conclusions. Its center is the claim itself.\n"
+            "- problem: The research problem itself: the problem statement, problem revisions, assumption changes, object definitions, or changes in the research target.\n"
+            "- verified_conclusion: A reusable verified mathematical result, including verified intermediate lemmas, propositions, constructions, or classifications. Its center is the claim itself.\n"
             "- verification: A review/checking report about a claim, problem, proof, computation, or final result. Its center is the checking process, verdict, objections, scores, gaps, or repair targets.\n"
-            "- final_result: A final theorem, final answer, or final report-level result of the project.\n"
-            "- counterexample: A construction, example, or argument that refutes a claim.\n"
-            "- failed_path: A route, method, proof strategy, estimate, or branch that failed or became unusable; it may coexist with a counterexample record from the same turn.\n"
-            "- research_note: Any other useful research progress, calculation, plan, attempt, observation, or local derivation.\n\n"
+            "- project_result: The project-level final result only. Use this only when the main research turn presents the overall project result and final verification has passed; ordinary lemmas, propositions, theorems, constructions, or classifications belong in verified_conclusion.\n"
+            "- counterexample: A counterexample or negative construction refuting a claim. Even if the counterexample was verified, use counterexample rather than verified_conclusion when the record centers on refutation.\n"
+            "- failed_path: A failed route, method, proof strategy, estimate, or branch. It may coexist with counterexample, but failed_path centers on why the method or route failed, while counterexample centers on the object that refutes a claim.\n"
+            "- research_note: Other stage-level research progress: unverified derivations, computations, observations, local reductions, plans, or next steps. Do not use research_note for conclusions that have already passed verification.\n\n"
+            "Important boundary: project_result versus verified_conclusion:\n"
+            "- project_result is reserved for the final project-level outcome after final verification has passed.\n"
+            "- verified_conclusion is for all reusable verified mathematics below the project-result level, including verified lemmas, propositions, ordinary theorems, constructions, classifications, and intermediate negative results.\n"
+            "- If a result is mathematically verified but is not the whole project's final answer, classify it as verified_conclusion, not project_result.\n"
+            "- If final verification is absent, unclear, or only intermediate, do not use project_result.\n\n"
             "Classification rules:\n"
             "- Each record must use exactly one type from the list above.\n"
             "- If the current turn contains multiple kinds of material, split it into multiple records.\n"
@@ -4128,19 +4449,22 @@ class ResearchWorkflowManager(object):
             "- Use verification for quality-assessor reviews, verify_* tool outputs, failed checks, gap reports, and repair guidance.\n"
             "- Use verified_conclusion only when there is a standalone mathematical statement that future turns can cite as true. Do not use it merely because a verification call occurred.\n"
             "- When a verification call passes a reusable claim, you may create both records: verification for the review report and verified_conclusion for the reusable mathematical statement. If this would duplicate content, prefer verified_conclusion plus a short verification note inside it.\n"
-            "- The content field is not a diary log or a title-level index. It must be a clear research progress report: specific, readable, and complete enough to preserve the substantive work of the turn.\n"
+            "- Use project_result only for the overall project result or report-level conclusion when the current context shows final verification has passed, such as verify_overall(scope=\"final\") passing. For a verified intermediate theorem, lemma, construction, or classification, use verified_conclusion instead.\n"
+            "- If a verified counterexample refutes a claim, use counterexample for the refuting construction; use failed_path separately only if the turn also explains a route or method that failed.\n"
+            "- The content field is not a diary log, transcript summary, or title-level index. It must read like a clear, concise mini research report: professional, specific, mathematically informative, and complete enough to preserve the substantive work of the turn.\n"
             "- Preserve concrete mathematical details from the turn: exact statements, hypotheses, definitions, parameter values, formulas, proof reductions, computations, verifier objections, failed inequalities, examples, counterexamples, and next technical targets when present.\n"
+            "- Include enough detail for important claims, constructions, verifications, and failed attempts to be evaluated later, but avoid padding, generic commentary, and repeated background that does not affect the record.\n"
             "- Source refs are for auditing and recovery, not a substitute for content. Do not write records that merely say something was checked, derived, or verified without recording what was checked, derived, or verified.\n"
             "- Avoid filler and transcript-style narration, but do not over-compress important proof or calculation details.\n"
             "\n"
             "Content requirements by type:\n"
             "- problem: State the research problem or revision concretely enough to recover the object under study, the main question or target, and any important assumptions, scope choices, or motivations that appear in the turn.\n"
-            "- verified_conclusion: Record the reusable verified result as a citable conclusion. Include the statement and the essential reason it is justified; include assumptions, proof ideas, formulas, verification evidence, or limitations when they are relevant in the turn.\n"
-            "- verification: Record what was checked and what the check found. Include the checked item, verifier/tool/scope, verdict, objections, caveats, repair targets, or per-dimension details when they are available.\n"
-            "- final_result: Record the project-level result in the form most natural for the project. Include the final answer/theorem/construction/classification/negative result as applicable, plus the key supporting idea, verification status, and remaining limitations or open ends when present.\n"
-            "- counterexample: Record the refuted claim and the example or construction concretely enough to reuse it. Include parameters, computations, contradiction, or scope caveats when they are part of the turn.\n"
-            "- failed_path: Record the attempted route and why it failed or became too weak. Include the goal, obstruction, evidence, and lesson for future work when present.\n"
-            "- research_note: Record useful local progress in the form most helpful for continuation: calculation, observation, plan, reduction, partial proof, experiment, or next technical target. Avoid vague diary text; preserve formulas and intermediate reductions when present.\n"
+            "- verified_conclusion: Record the reusable verified result as a citable conclusion. Include the full statement, essential hypotheses, conclusion, proof idea or key derivation, verification evidence, and relevant scope limits when they appear in the turn.\n"
+            "- verification: Record what was checked and what the check found. Include the checked item, verifier/tool/scope, verdict, major objections or pass reasons, caveats, repair targets, or per-dimension details when they are available.\n"
+            "- project_result: Record only the project-level final result in the form most natural for the project, and only when final verification passed in the current context. Include the final answer/theorem/construction/classification/negative result as applicable, plus the key supporting idea, final verification evidence, and remaining limitations or open ends when present.\n"
+            "- counterexample: Record the refuted claim and the example or construction concretely enough to reuse it. Include parameters, definitions, computations, contradiction mechanism, or scope caveats when they are part of the turn.\n"
+            "- failed_path: Record the attempted route and why it failed or became too weak. Include the goal, method, precise obstruction, evidence of failure, and lesson for future work when present.\n"
+            "- research_note: Record useful local progress in the form most helpful for continuation: calculation, observation, plan, reduction, partial proof, experiment, or next technical target. Avoid vague diary text; preserve formulas, intermediate reductions, and concrete open subproblems when present.\n"
             "\n"
             "Output contract:\n"
             "- Return exactly one JSON object with this top-level shape: {\"records\": [...]}.\n"
@@ -4167,22 +4491,34 @@ class ResearchWorkflowManager(object):
                 "You extract substantive per-turn research progress reports without adding new claims. "
                 "Your records should preserve the scientific or mathematical work in a clear, specific, and reusable form. "
                 "You must classify every record with exactly one of these types: "
-                "problem, verified_conclusion, verification, final_result, counterexample, failed_path, research_note. "
+                "problem, verified_conclusion, verification, project_result, counterexample, failed_path, research_note. "
                 "Definitions: problem means the research object or its revisions; "
                 "verified_conclusion means a reusable verified mathematical result centered on the claim itself; "
                 "verification means a review/checking report centered on verdicts, scores, objections, gaps, or repair targets; "
-                "final_result means a final theorem, answer, or report-level result; "
-                "counterexample means a construction or argument refuting a claim; "
-                "failed_path means a failed method, route, proof strategy, estimate, or branch and may coexist with counterexample; "
-                "research_note means all other useful research progress, calculations, plans, attempts, observations, or local derivations. "
+                "project_result means the project-level final theorem, answer, or report-level result after final verification has passed; "
+                "counterexample means a construction or argument refuting a claim, even when verified; "
+                "failed_path means a failed method, route, proof strategy, estimate, or branch and may coexist with counterexample when the method failure should be recorded separately; "
+                "research_note means all other useful unverified or stage-level research progress, calculations, plans, attempts, observations, or local derivations. "
+                "The key boundary is that verified mathematics below the whole-project final answer is verified_conclusion, while project_result is only for the final project-level outcome after final verification. "
                 "Split mixed material into multiple records and do not create verified_conclusion unless verification passed. "
-                "Preserve exact statements, formulas, parameters, proof sketches, verification evidence, limitations, and next technical targets when present. "
+                "Write concise mini research reports, not diary entries. Preserve exact statements, formulas, parameters, proof sketches, verification evidence, limitations, and next technical targets when present. "
                 "Follow the per-type content requirements in the user message."
             ),
             messages=[{"role": "user", "content": prompt}],
             response_schema=RESEARCH_ARCHIVE_SCHEMA,
             schema_name="research_turn_archive",
         )
+        if isinstance(payload, dict):
+            normalized_records = []
+            for record in list(payload.get("records") or []):
+                if not isinstance(record, dict):
+                    normalized_records.append(record)
+                    continue
+                normalized_record = dict(record)
+                normalized_record["type"] = normalize_research_log_type(str(normalized_record.get("type") or "research_note"))
+                normalized_records.append(normalized_record)
+            payload = dict(payload)
+            payload["records"] = normalized_records
         validate_json_schema(payload, RESEARCH_ARCHIVE_SCHEMA)
         if self.session_store is not None and session_id:
             try:

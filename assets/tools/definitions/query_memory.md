@@ -11,14 +11,14 @@
       "all_projects": {"type": "boolean", "description": "When true, search across all projects instead of restricting retrieval to the current project scope."},
       "types": {
         "type": "array",
-        "description": "Preferred research-log type filter for research mode. Use only when the need is clearly type-specific. Types: problem=problems/revisions; verified_conclusion=verified lemmas or conclusions; verification=verifier reports; final_result=final theorems/results; counterexample=explicit refutations; failed_path=failed routes or methods; research_note=other progress notes.",
+        "description": "Preferred research-log type filter for research mode. Use only when the need is clearly type-specific. Types: problem=problems/revisions; verified_conclusion=verified reusable lemmas or conclusions; verification=verifier reports; project_result=project-level final theorems/results; counterexample=explicit refutations; failed_path=failed routes or methods; research_note=other progress notes.",
         "items": {
           "type": "string",
           "enum": [
             "problem",
             "verified_conclusion",
             "verification",
-            "final_result",
+            "project_result",
             "counterexample",
             "failed_path",
             "research_note"
@@ -34,7 +34,7 @@
             "problem",
             "verified_conclusion",
             "verification",
-            "final_result",
+            "project_result",
             "counterexample",
             "failed_path",
             "research_note",

@@ -9,7 +9,7 @@
     "properties": {
       "query": {"type": "string", "description": "Keyword or phrase to search in original session-record content."},
       "session_id": {"type": "string", "description": "Optional session id. Defaults to the active session."},
-      "limit": {"type": "integer", "description": "Maximum number of matching session-record results to return."}
+      "limit": {"type": "integer", "description": "Maximum number of matching session-record results to return.", "minimum": 1, "maximum": 50}
     },
     "required": ["query"]
   }

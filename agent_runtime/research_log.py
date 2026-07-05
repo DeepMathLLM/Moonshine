@@ -15,36 +15,49 @@ RESEARCH_LOG_TYPES = [
     "problem",
     "verified_conclusion",
     "verification",
-    "final_result",
+    "project_result",
     "counterexample",
     "failed_path",
     "research_note",
 ]
 
 
+RESEARCH_LOG_TYPE_ALIASES = {
+    "conclusion": "verified_conclusion",
+    "lemma": "verified_conclusion",
+    "intermediate_conclusion": "verified_conclusion",
+    "verify": "verification",
+    "verification_reports": "verification",
+    "final_result": "project_result",
+    "final_results": "project_result",
+    "project_final": "project_result",
+    "project_final_result": "project_result",
+    "note": "research_note",
+    "progress": "research_note",
+    "method_progress": "research_note",
+    "failed_paths": "failed_path",
+    "solve_steps": "research_note",
+    "subgoals": "research_note",
+    "branch_states": "research_note",
+    "special_case_checks": "research_note",
+    "novelty_notes": "research_note",
+}
+
+
+def canonical_research_log_type(value: str) -> str:
+    """Return a canonical type name for known types/aliases, preserving unknown names."""
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
+    return RESEARCH_LOG_TYPE_ALIASES.get(normalized, normalized)
+
+
 def normalize_research_log_type(value: str) -> str:
     """Return a canonical research-log type."""
-    normalized = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
-    aliases = {
-        "conclusion": "verified_conclusion",
-        "lemma": "verified_conclusion",
-        "intermediate_conclusion": "verified_conclusion",
-        "verify": "verification",
-        "verification_reports": "verification",
-        "result": "final_result",
-        "final": "final_result",
-        "note": "research_note",
-        "progress": "research_note",
-        "method_progress": "research_note",
-        "failed_paths": "failed_path",
-        "solve_steps": "research_note",
-        "subgoals": "research_note",
-        "branch_states": "research_note",
-        "special_case_checks": "research_note",
-        "novelty_notes": "research_note",
-    }
-    canonical = aliases.get(normalized, normalized)
+    canonical = canonical_research_log_type(value)
     return canonical if canonical in RESEARCH_LOG_TYPES else "research_note"
+
+
+def _normalized_type_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
 
 
 def _hash_text(text: str) -> str:
@@ -129,6 +142,41 @@ class ResearchLogStore(object):
             for item in read_jsonl(self.summaries_path(project_slug))
             if isinstance(item, dict)
         ]
+
+    def _migrate_legacy_project_result_records(self, project_slug: str) -> bool:
+        """Rewrite old raw final_result record types to project_result without dropping malformed rows."""
+        path = self.log_path(project_slug)
+        source = read_text(path, default="")
+        if not source.strip():
+            return False
+        changed = False
+        output_lines = []
+        for raw_line in source.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                output_lines.append(raw_line)
+                continue
+            try:
+                payload = json.loads(raw_line)
+            except ValueError:
+                output_lines.append(raw_line)
+                continue
+            if not isinstance(payload, dict):
+                output_lines.append(raw_line)
+                continue
+            raw_type = str(payload.get("type") or "")
+            if (
+                canonical_research_log_type(raw_type) == "project_result"
+                and _normalized_type_token(raw_type) != "project_result"
+            ):
+                payload = dict(payload)
+                payload["type"] = "project_result"
+                raw_line = json.dumps(payload, ensure_ascii=False)
+                changed = True
+            output_lines.append(raw_line)
+        if changed:
+            atomic_write(path, "\n".join(output_lines).rstrip() + "\n")
+        return changed
 
     def _connect(self, project_slug: str):
         path = self.index_path(project_slug)
@@ -216,13 +264,22 @@ class ResearchLogStore(object):
                 self._upsert_record(conn, record, fts_available=fts_available)
                 count += 1
             conn.commit()
+            legacy_final_result_path = self.paths.project_research_log_type_file(project_slug, "final_result")
+            if legacy_final_result_path.exists():
+                self.rebuild_markdown_views(project_slug)
             return {"project_slug": project_slug, "indexed": count, "fts": fts_available}
         finally:
             conn.close()
 
     def records(self, project_slug: str) -> List[Dict[str, object]]:
         """Return all records for one project."""
-        return [dict(item) for item in self._record_rows(project_slug)]
+        self._migrate_legacy_project_result_records(project_slug)
+        rows = []
+        for item in self._record_rows(project_slug):
+            record = dict(item)
+            record["type"] = normalize_research_log_type(str(record.get("type") or "research_note"))
+            rows.append(record)
+        return rows
 
     def append_summary(self, project_slug: str, summary: Dict[str, object]) -> None:
         """Append one reusable compression summary into research_log_summaries.jsonl."""
@@ -326,6 +383,13 @@ class ResearchLogStore(object):
             header = "# %s" % record_type.replace("_", " ").title()
             body = "\n\n".join(by_type.get(record_type, []))
             atomic_write(path, (header + ("\n\n" + body if body else "") + "\n").rstrip() + "\n")
+        legacy_final_result_path = self.paths.project_research_log_type_file(project_slug, "final_result")
+        project_result_path = self.paths.project_research_log_type_file(project_slug, "project_result")
+        if legacy_final_result_path != project_result_path and legacy_final_result_path.exists():
+            try:
+                legacy_final_result_path.unlink()
+            except OSError:
+                pass
         return {"project_slug": project_slug, "records": len(records), "types": len(RESEARCH_LOG_TYPES)}
 
     def _sync_blueprint_markdown(self, project_slug: str) -> None:
@@ -363,14 +427,76 @@ class ResearchLogStore(object):
         limit: int = 5,
     ) -> List[Dict[str, object]]:
         """Search research-log records, returning content directly."""
-        selected_types = [normalize_research_log_type(item) for item in list(types or []) if str(item).strip()]
-        selected_types = list(dict.fromkeys(selected_types))
+        selected_types: List[str] = []
+        saw_type_filter = False
+        for item in list(types or []):
+            raw_type = str(item or "").strip()
+            if not raw_type:
+                continue
+            saw_type_filter = True
+            canonical_type = canonical_research_log_type(raw_type)
+            if canonical_type in RESEARCH_LOG_TYPES and canonical_type not in selected_types:
+                selected_types.append(canonical_type)
+        if saw_type_filter and not selected_types:
+            return []
         rows: List[Dict[str, object]] = []
         projects = [project_slug] if project_slug else self._all_projects()
         for slug in [str(item) for item in projects if str(item or "").strip()]:
             rows.extend(self._search_one_project(slug, query=query, types=selected_types, limit=limit))
         rows.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("created_at") or "")))
         return rows[: max(1, int(limit or 5))]
+
+    def select_records(
+        self,
+        *,
+        project_slug: Optional[str],
+        types: Optional[Sequence[str]] = None,
+        mode: str = "recent",
+        limit_per_type: int = 5,
+    ) -> List[Dict[str, object]]:
+        """Return research-log records by type without query ranking."""
+        selected_types: List[str] = []
+        saw_type_filter = False
+        for item in list(types or []):
+            raw_type = str(item or "").strip()
+            if not raw_type:
+                continue
+            saw_type_filter = True
+            canonical_type = canonical_research_log_type(raw_type)
+            if canonical_type in RESEARCH_LOG_TYPES and canonical_type not in selected_types:
+                selected_types.append(canonical_type)
+        if saw_type_filter and not selected_types:
+            return []
+        projects = [project_slug] if project_slug else self._all_projects()
+        limit = max(1, int(limit_per_type or 5))
+        retrieval_mode = str(mode or "recent").strip().lower()
+        rows: List[Dict[str, object]] = []
+        for slug in [str(item) for item in projects if str(item or "").strip()]:
+            records = self.records(slug)
+            candidate_types = selected_types or RESEARCH_LOG_TYPES
+            for record_type in candidate_types:
+                typed_records = [
+                    dict(record)
+                    for record in records
+                    if normalize_research_log_type(str(record.get("type") or "research_note")) == record_type
+                ]
+                selected = typed_records[-limit:] if retrieval_mode == "recent" else typed_records[:limit]
+                if retrieval_mode == "recent":
+                    selected = list(reversed(selected))
+                for index, record in enumerate(selected):
+                    if not str(record.get("project_slug") or "").strip():
+                        record["project_slug"] = slug
+                    rows.append(
+                        self._coerce_record_dict(
+                            record,
+                            query="",
+                            score=1.0 / float(index + 1),
+                            retrieval_mode=retrieval_mode,
+                        )
+                    )
+        if retrieval_mode == "recent":
+            rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return rows[: max(1, limit * max(1, len(selected_types) or 1))]
 
     def _all_projects(self) -> List[str]:
         if not self.paths.projects_dir.exists():
@@ -459,6 +585,55 @@ class ResearchLogStore(object):
             },
         }
 
+    def _coerce_record_dict(
+        self,
+        record: Dict[str, object],
+        *,
+        query: str,
+        score: float,
+        retrieval_mode: str,
+    ) -> Dict[str, object]:
+        refs = [str(item) for item in list(record.get("source_refs") or []) if str(item).strip()]
+        content = str(record.get("content") or "")
+        project_slug = str(record.get("project_slug") or "")
+        record_type = normalize_research_log_type(str(record.get("type") or "research_note"))
+        record_id = str(record.get("id") or "").strip() or "rec-%s" % _hash_text(
+            "%s\n%s\n%s\n%s"
+            % (
+                project_slug,
+                record_type,
+                str(record.get("title") or ""),
+                content,
+            )
+        )
+        return {
+            "id": record_id,
+            "key": "research-log:%s" % record_id,
+            "source": "research-log",
+            "source_type": "research_log",
+            "artifact_type": record_type,
+            "type": record_type,
+            "title": str(record.get("title") or ""),
+            "content": content,
+            "content_inline": _best_excerpt(content, query),
+            "content_path": self.paths.project_research_log_file(project_slug).relative_to(self.paths.home).as_posix(),
+            "project_slug": project_slug,
+            "session_id": str(record.get("session_id") or ""),
+            "round_id": str(record.get("round_id") or ""),
+            "source_refs": refs,
+            "created_at": str(record.get("created_at") or ""),
+            "score": float(score or 0.0),
+            "metadata": {
+                "source_type": "research_log",
+                "record_type": record_type,
+                "retrieval_mode": retrieval_mode,
+                "source_refs": refs,
+                "source_path": self.paths.project_research_log_file(project_slug).relative_to(self.paths.home).as_posix(),
+                "exact_excerpt": _best_excerpt(content, query),
+                "raw_text": content,
+            },
+        }
+
 
 RESEARCH_ARCHIVE_SCHEMA = {
     "type": "object",
@@ -488,7 +663,7 @@ def render_research_log_for_archive(records: Sequence[Dict[str, object]]) -> str
     for item in records:
         lines.append(
             "[{record_type}] {title}\n{content}".format(
-                record_type=str(item.get("type") or "research_note"),
+                record_type=normalize_research_log_type(str(item.get("type") or "research_note")),
                 title=str(item.get("title") or ""),
                 content=str(item.get("content") or ""),
             )

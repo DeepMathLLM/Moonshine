@@ -8,7 +8,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from moonshine.agent_runtime.model_metadata import resolve_model_context_window
 from moonshine.agent_runtime.memory_provider import ContextBundle
-from moonshine.agent_runtime.research_log import ResearchLogStore, normalize_research_log_type
+from moonshine.agent_runtime.research_log import (
+    RESEARCH_LOG_TYPES,
+    ResearchLogStore,
+    canonical_research_log_type,
+)
 from moonshine.providers import OfflineProvider
 from moonshine.storage.session_store import RETRIEVAL_TOOL_EVENT_NAMES
 from moonshine.utils import (
@@ -1666,21 +1670,39 @@ class ContextManager(object):
     ) -> Dict[str, object]:
         """Run on-demand retrieval through non-overlapping memory sources."""
         research_log_types: List[str] = []
+        saw_research_type_filter = False
         for type_name in list(types or []) + list(channels or []):
-            normalized_type = normalize_research_log_type(str(type_name))
+            raw_type = str(type_name or "").strip()
+            if not raw_type:
+                continue
+            saw_research_type_filter = True
+            normalized_type = canonical_research_log_type(raw_type)
+            if normalized_type not in RESEARCH_LOG_TYPES:
+                continue
             if normalized_type and normalized_type not in research_log_types:
                 research_log_types.append(normalized_type)
 
         result_limit = max(1, int(limit_per_channel or 3))
-        research_log_hits = self.research_log.search(
-            query=query,
-            project_slug=project_slug,
-            types=research_log_types,
-            limit=result_limit * max(1, len(research_log_types) or 1),
-        )
+        normalized_channel_mode = str(channel_mode or "search").strip().lower()
+        if saw_research_type_filter and not research_log_types:
+            research_log_hits = []
+        elif saw_research_type_filter and normalized_channel_mode in {"recent", "all"}:
+            research_log_hits = self.research_log.select_records(
+                project_slug=project_slug,
+                types=research_log_types,
+                mode=normalized_channel_mode,
+                limit_per_type=result_limit,
+            )
+        else:
+            research_log_hits = self.research_log.search(
+                query=query,
+                project_slug=project_slug,
+                types=research_log_types,
+                limit=result_limit * max(1, len(research_log_types) or 1),
+            )
 
         raw_hits: Dict[str, object] = {}
-        if not research_log_types:
+        if not research_log_types and not saw_research_type_filter:
             raw_hits = self.memory_manager.query_memory_sources(
                 query,
                 project_slug,
@@ -1694,7 +1716,7 @@ class ContextManager(object):
         knowledge_hits = list(raw_hits.get("knowledge_hits") or [])
 
         ranked_lists = [self._normalize_research_hits(research_log_hits)]
-        if not research_log_types:
+        if not research_log_types and not saw_research_type_filter:
             ranked_lists.extend(
                 [
                     self._normalize_session_record_hits(session_record_hits),

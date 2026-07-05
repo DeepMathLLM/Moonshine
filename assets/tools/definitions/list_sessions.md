@@ -6,7 +6,7 @@
   "parameters": {
     "type": "object",
     "properties": {
-      "limit": {"type": "integer", "description": "Maximum number of sessions to return."}
+      "limit": {"type": "integer", "description": "Maximum number of sessions to return.", "minimum": 1, "maximum": 100}
     }
   }
 }

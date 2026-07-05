@@ -110,9 +110,9 @@ def normalize_project_slug(value: str) -> str:
     return (text[:80].strip("_") or "research_project")
 
 
-def build_research_mode_policy(project_slug: str) -> str:
+def build_research_mode_policy(project_slug: str, agent_slug: str = "") -> str:
     """Return the system-prompt policy injected for mode=research."""
-    return (
+    lines = [
         "You are working inside project `%s` and carrying the mathematics forward directly.\n"
         "- Act like a mathematician pursuing a complete line of research: choose the next move yourself, work from evidence, and keep branches coherent across turns.\n"
         "- Treat the current multi-turn conversation as the live research context.\n"
@@ -120,10 +120,19 @@ def build_research_mode_policy(project_slug: str) -> str:
         "- `memory/research_log.md`, `memory/research_log.jsonl`, `memory/by_type/*.md`, and `memory/research_log_index.sqlite` are project research-memory sources for reading and retrieval through `query_memory` or file reads when prior project work matters.\n"
         "- State important mathematical progress, failed paths, counterexamples, and verified results clearly so they remain usable through later project-memory retrieval.\n"
         "- Match each nontrivial research step to the available skills and tools. When a listed skill fits the step, call `load_skill_definition` before using that skill's workflow unless the full definition is already in context.\n"
-        "- Serious gate: do not start solving a selected problem until it has passed one dedicated `quality-assessor` review. If no passed review exists for the active problem, load `quality-assessor`, call `assess_problem_quality` once, and keep refining/designing the problem instead of attacking it as a theorem.\n"
-        "- Use tools to read, retrieve, and verify when those actions support the research evidence; do not use tool payloads as the main home for mathematical reasoning.\n"
-        "- If you judge that you have reached the final project-level proof or result, call `verify_overall` with `scope=\"final\"` before accepting it; otherwise use intermediate verification.\n"
-    ) % project_slug
+        % project_slug
+    ]
+    if str(agent_slug or "").strip() != "moonshine-core":
+        lines.append(
+            "- Serious gate: do not start solving a selected problem until it has passed one dedicated `quality-assessor` review. If no passed review exists for the active problem, load `quality-assessor`, call `assess_problem_quality` once, and keep refining/designing the problem instead of attacking it as a theorem."
+        )
+    lines.extend(
+        [
+            "- Use tools to read, retrieve, and verify when those actions support the research evidence; do not use tool payloads as the main home for mathematical reasoning.",
+            "- If you judge that you have reached the final project-level proof or result, call `verify_overall` with `scope=\"final\"` before accepting it; otherwise use intermediate verification.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 class ResearchProjectResolver(object):
