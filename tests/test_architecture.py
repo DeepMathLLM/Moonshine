@@ -27,12 +27,13 @@ from moonshine.moonshine_constants import (
     packaged_builtin_skills_dir,
     packaged_tool_definitions_dir,
 )
-from moonshine.providers import BaseProvider, AzureOpenAIChatCompletionsProvider, OpenAIChatCompletionsProvider, ProviderResponse, ProviderStreamEvent, ProviderToolCall
+from moonshine.providers import BaseProvider, AzureOpenAIChatCompletionsProvider, OpenAIChatCompletionsProvider, OpenAIResponsesProvider, ProviderResponse, ProviderStreamEvent, ProviderToolCall
 from moonshine.run_agent import AgentEvent, main as run_agent_main, render_agent_events
 from moonshine.skills.skill_document import parse_skill_document, validate_skill_document
 from moonshine.storage.knowledge_vector_store import SQLiteVectorBackend
 from moonshine.structured_tasks import get_structured_task, list_structured_tasks
 from moonshine.utils import append_jsonl, atomic_write, read_json, read_jsonl, read_text
+from moonshine.json_schema import JsonSchemaValidationError
 
 
 class ScriptedProvider(object):
@@ -80,6 +81,11 @@ class ResearchWorkflowProvider(ScriptedProvider):
             if self.archive_responses:
                 return json.loads(json.dumps(self.archive_responses.pop(0)))
             return {"records": []}
+        if schema_name == "research_final_report":
+            return {
+                "title": "Scripted Final Research Report",
+                "report_markdown": "# Scripted Final Research Report\n\nThe verified run completed.",
+            }
         if not self.structured_responses:
             raise AssertionError("ResearchWorkflowProvider ran out of structured responses")
         return json.loads(self.structured_responses.pop(0))
@@ -379,6 +385,713 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertTrue(any("archival provider is offline or unavailable" in item for item in statuses))
         self.assertTrue(any("Research autopilot stopped because the archival provider is offline or unavailable." in item for item in statuses))
 
+    def test_final_research_report_generation_retries_and_uses_complete_verification_payload(self):
+        class FlakyReportProvider(object):
+            def __init__(self):
+                self.calls = []
+
+            def generate_structured(self, *, system_prompt, messages, response_schema, schema_name):
+                self.calls.append(
+                    {
+                        "system_prompt": system_prompt,
+                        "messages": [dict(item) for item in messages],
+                        "response_schema": dict(response_schema),
+                        "schema_name": schema_name,
+                    }
+                )
+                if len(self.calls) < 3:
+                    raise RuntimeError("temporary report failure")
+                return {
+                    "title": "Verified Local Criterion Report",
+                    "report_markdown": "# Verified Local Criterion Report\n\nThe recorded final proof is presented faithfully.",
+                }
+
+        provider = FlakyReportProvider()
+        workflow = self.app.agent.research_workflow
+        workflow.provider = provider
+        workflow.research_log.append_records(
+            self.state.project_slug,
+            [
+                {
+                    "type": "project_result",
+                    "title": "Verified local criterion",
+                    "content": "The project-level final result passed final verification.",
+                    "session_id": self.state.session_id,
+                }
+            ],
+        )
+        previous_report_path = self.app.paths.project_reports_dir(self.state.project_slug) / "2026-01-01_00-00-00_previous-report.md"
+        atomic_write(
+            previous_report_path,
+            "# Previous Report\n\nPrior verified progress: the project had already established the preliminary localization lemma.",
+        )
+        self.app.session_store.append_message(self.state.session_id, "user", "Prove the local criterion.")
+        self.app.session_store.append_message(
+            self.state.session_id,
+            "assistant",
+            "The proof is ready for final verification.",
+            metadata={"reasoning_content": "I will verify the complete proof."},
+        )
+        complete_proof = (
+            "Complete proof body: assume the maximal-local hypotheses, pass to every maximal localization, "
+            "use the recorded local lemma, and glue the vanishing obstruction globally."
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "verify_overall",
+                "call_id": "call-final-report-proof",
+                "arguments": {
+                    "project_slug": self.state.project_slug,
+                    "scope": "final",
+                    "claim": "The local criterion is valid.",
+                    "proof": complete_proof,
+                },
+                "output": {
+                    "scope": "final",
+                    "passed": True,
+                    "summary": "All verification dimensions passed.",
+                },
+                "error": None,
+                "tool_round": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        payload = workflow.generate_final_report(
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+            offsets={"messages": 0, "tool_events": 0, "research_log": 0},
+            retries=3,
+        )
+
+        self.assertTrue(payload["written"])
+        self.assertEqual(payload["attempts"], 3)
+        self.assertEqual([call["schema_name"] for call in provider.calls], ["research_final_report"] * 3)
+        system_prompt = provider.calls[-1]["system_prompt"]
+        self.assertIn("Begin report_markdown with a concise summary of all prior research progress", system_prompt)
+        self.assertIn("not a chronological run log", system_prompt)
+        prompt = provider.calls[-1]["messages"][0]["content"]
+        self.assertIn("source material only", prompt)
+        self.assertNotIn("The Markdown report should read like", prompt)
+        self.assertIn("Prior verified progress", prompt)
+        self.assertIn(complete_proof, prompt)
+        self.assertEqual(prompt.count(complete_proof), 1)
+        self.assertIn("Complete final verify_overall", prompt)
+        self.assertIn("[reasoning]", prompt)
+        report_path = self.app.paths.home / payload["report_path"]
+        self.assertTrue(report_path.exists())
+        self.assertIn("Verified Local Criterion Report", read_text(report_path))
+
+    def test_research_report_offsets_persist_until_report_written(self):
+        first_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        offset_path = self.app._research_report_offset_file(self.state)
+        self.assertTrue(offset_path.exists())
+        self.app.session_store.append_message(self.state.session_id, "user", "First manual research turn.")
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "verify_correctness_logic",
+                "call_id": "call-logic-offset",
+                "arguments": {"claim": "A", "proof": "B"},
+                "output": {"passed": True},
+                "error": None,
+                "tool_round": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.app.agent.research_workflow.research_log.append_records(
+            self.state.project_slug,
+            [
+                {
+                    "type": "research_note",
+                    "title": "Manual turn progress",
+                    "content": "The manual turn produced a useful intermediate calculation.",
+                }
+            ],
+        )
+
+        second_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.assertEqual(second_offsets["messages"], first_offsets["messages"])
+        self.assertEqual(second_offsets["tool_events"], first_offsets["tool_events"])
+        self.assertEqual(second_offsets["research_log"], first_offsets["research_log"])
+
+        self.app._clear_research_report_offsets(self.state)
+        third_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.assertGreater(third_offsets["messages"], first_offsets["messages"])
+        self.assertGreater(third_offsets["tool_events"], first_offsets["tool_events"])
+        self.assertGreater(third_offsets["research_log"], first_offsets["research_log"])
+
+    def test_research_report_offsets_survive_process_restart(self):
+        first_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.app.session_store.append_message(self.state.session_id, "user", "Content after persistent offset.")
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "verify_correctness_logic",
+                "call_id": "call-persistent-offset",
+                "arguments": {"claim": "A", "proof": "B"},
+                "output": {"passed": True},
+                "error": None,
+                "tool_round": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.app.agent.research_workflow.research_log.append_records(
+            self.state.project_slug,
+            [
+                {
+                    "type": "research_note",
+                    "title": "Progress after persistent offset",
+                    "content": "This content should still belong to the pending report window after restart.",
+                }
+            ],
+        )
+
+        resumed_app = MoonshineApp(home=self.temp_dir.name)
+        resumed_state = resumed_app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        resumed_offsets = dict(resumed_app._ensure_research_report_offsets(resumed_state))
+
+        self.assertEqual(resumed_offsets["messages"], first_offsets["messages"])
+        self.assertEqual(resumed_offsets["tool_events"], first_offsets["tool_events"])
+        self.assertEqual(resumed_offsets["research_log"], first_offsets["research_log"])
+
+    def test_final_report_research_log_slice_includes_project_rows_from_other_sessions(self):
+        offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        other_state = self.app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+        )
+        self.app.agent.research_workflow.research_log.append_records(
+            self.state.project_slug,
+            [
+                {
+                    "type": "research_note",
+                    "title": "Other session progress",
+                    "content": "OTHER_SESSION_ONLY_SENTINEL",
+                    "session_id": other_state.session_id,
+                    "source_refs": ["sessions/%s/messages.jsonl" % other_state.session_id],
+                },
+                {
+                    "type": "project_result",
+                    "title": "Current session final progress",
+                    "content": "CURRENT_SESSION_ONLY_SENTINEL",
+                    "session_id": self.state.session_id,
+                    "source_refs": ["sessions/%s/messages.jsonl" % self.state.session_id],
+                },
+            ],
+        )
+
+        prompt = self.app.agent.research_workflow._build_final_report_prompt(
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+            offsets=offsets,
+        )
+
+        self.assertIn("CURRENT_SESSION_ONLY_SENTINEL", prompt)
+        self.assertIn("OTHER_SESSION_ONLY_SENTINEL", prompt)
+
+    def test_final_report_offsets_include_pending_sessions_from_same_project(self):
+        first_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.app.session_store.append_message(self.state.session_id, "assistant", "OLD_PENDING_MESSAGE_SENTINEL")
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "verify_overall",
+                "call_id": "call-old-pending-final",
+                "arguments": {
+                    "project_slug": self.state.project_slug,
+                    "scope": "final",
+                    "claim": "Old pending theorem.",
+                    "proof": "OLD_PENDING_TOOL_SENTINEL",
+                },
+                "output": {"scope": "final", "passed": True},
+                "error": None,
+                "tool_round": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.app.agent.research_workflow.research_log.append_records(
+            self.state.project_slug,
+            [
+                {
+                    "type": "project_result",
+                    "title": "Old pending project result",
+                    "content": "OLD_PENDING_RESEARCH_LOG_SENTINEL",
+                    "session_id": self.state.session_id,
+                }
+            ],
+        )
+        new_state = self.app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+        )
+        new_offsets = dict(self.app._ensure_research_report_offsets(new_state))
+        self.app.session_store.append_message(new_state.session_id, "assistant", "NEW_SESSION_MESSAGE_SENTINEL")
+
+        combined_offsets = self.app._final_report_generation_offsets(new_state, new_offsets)
+        prompt = self.app.agent.research_workflow._build_final_report_prompt(
+            project_slug=new_state.project_slug,
+            session_id=new_state.session_id,
+            offsets=combined_offsets,
+        )
+
+        self.assertEqual(combined_offsets["research_log"], first_offsets["research_log"])
+        self.assertIn("OLD_PENDING_MESSAGE_SENTINEL", prompt)
+        self.assertIn("OLD_PENDING_TOOL_SENTINEL", prompt)
+        self.assertIn("OLD_PENDING_RESEARCH_LOG_SENTINEL", prompt)
+        self.assertIn("NEW_SESSION_MESSAGE_SENTINEL", prompt)
+
+    def test_final_report_success_clears_all_pending_project_offsets(self):
+        self.app._ensure_research_report_offsets(self.state)
+        other_state = self.app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+        )
+        self.app._ensure_research_report_offsets(other_state)
+
+        self.assertTrue(self.app._research_report_offset_file(self.state).exists())
+        self.assertTrue(self.app._research_report_offset_file(other_state).exists())
+
+        self.app._clear_project_research_report_offsets(other_state)
+
+        self.assertFalse(self.app._research_report_offset_file(self.state).exists())
+        self.assertFalse(self.app._research_report_offset_file(other_state).exists())
+
+    def test_report_after_reenable_waits_for_new_final_verification_and_covers_old_offset(self):
+        first_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.app.session_store.append_message(self.state.session_id, "assistant", "Old verified result while report was unavailable.")
+
+        resumed_app = MoonshineApp(home=self.temp_dir.name)
+        resumed_state = resumed_app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        proof = "Complete new proof: incorporate the old verified result and close the final theorem."
+        provider = ResearchWorkflowProvider(
+            [
+                {
+                    "response": ProviderResponse(
+                        content="",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="verify_overall",
+                                arguments={
+                                    "project_slug": resumed_state.project_slug,
+                                    "scope": "final",
+                                    "claim": "The unified final theorem holds.",
+                                    "proof": proof,
+                                },
+                                call_id="call-new-final-after-reenable",
+                            )
+                        ],
+                    )
+                },
+                {
+                    "chunks": ["New final verification passed after re-enable."],
+                    "response": ProviderResponse(content="New final verification passed after re-enable."),
+                },
+            ],
+            [
+                json.dumps(self._dimension_review(reviewer_id="assumption-usage-reviewer", dimension="assumption", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="calculation-consistency-reviewer", dimension="computation", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="logical-chain-reviewer", dimension="logic", verdict="correct")),
+            ],
+            archive_responses=[
+                {
+                    "records": [
+                        {
+                            "type": "project_result",
+                            "title": "Unified final theorem",
+                            "content": "The unified final theorem passed the new final verification.",
+                        }
+                    ]
+                }
+            ],
+        )
+        resumed_app.verification_provider = provider
+        resumed_app.provider = provider
+        resumed_app.archival_provider = provider
+        resumed_app.agent.verification_provider = provider
+        resumed_app.agent.provider = provider
+        resumed_app.agent.archival_provider = provider
+        resumed_app.agent.research_workflow.provider = provider
+
+        events = list(resumed_app.ask_stream("Run the new final verification after re-enable.", resumed_state))
+        status_texts = [event.text for event in events if event.type == "status"]
+        report_prompts = [call for call in provider.structured_calls if call["schema_name"] == "research_final_report"]
+
+        self.assertTrue(any("Generating final research report" in item for item in status_texts))
+        self.assertTrue(any("Final research report written" in item for item in status_texts))
+        self.assertEqual(resumed_state.research_report_offsets, {})
+        self.assertEqual(first_offsets["messages"], 0)
+        self.assertIn("Old verified result while report was unavailable.", report_prompts[-1]["messages"][0]["content"])
+        self.assertIn(proof, report_prompts[-1]["messages"][0]["content"])
+
+    def test_ask_stream_generates_final_report_after_final_verification(self):
+        claim = "The scripted final theorem holds."
+        proof = "Complete proof: reduce the scripted theorem to the verified local case and glue the result."
+        provider = ResearchWorkflowProvider(
+            [
+                {
+                    "response": ProviderResponse(
+                        content="",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="verify_overall",
+                                arguments={
+                                    "project_slug": self.state.project_slug,
+                                    "scope": "final",
+                                    "claim": claim,
+                                    "proof": proof,
+                                },
+                                call_id="call-final-report-integration",
+                            )
+                        ],
+                    )
+                },
+                {
+                    "chunks": ["Final theorem verified."],
+                    "response": ProviderResponse(content="Final theorem verified."),
+                },
+            ],
+            [
+                json.dumps(self._dimension_review(reviewer_id="assumption-usage-reviewer", dimension="assumption", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="calculation-consistency-reviewer", dimension="computation", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="logical-chain-reviewer", dimension="logic", verdict="correct")),
+            ],
+            archive_responses=[
+                {
+                    "records": [
+                        {
+                            "type": "project_result",
+                            "title": "Scripted final theorem",
+                            "content": "The scripted final theorem passed final verification.",
+                        }
+                    ]
+                }
+            ],
+        )
+        self.app.provider = provider
+        self.app.verification_provider = provider
+        self.app.archival_provider = provider
+        self.app.agent.provider = provider
+        self.app.agent.verification_provider = provider
+        self.app.agent.archival_provider = provider
+        self.app.agent.research_workflow.provider = provider
+
+        events = list(self.app.ask_stream("Verify the final scripted theorem.", self.state))
+        status_texts = [event.text for event in events if event.type == "status"]
+        report_files = list(self.app.paths.project_reports_dir(self.state.project_slug).glob("*.md"))
+
+        self.assertTrue(any("Generating final research report" in item for item in status_texts))
+        self.assertTrue(any("Final research report written" in item for item in status_texts))
+        self.assertEqual(self.state.research_report_offsets, {})
+        self.assertFalse(self.app._research_report_offset_file(self.state).exists())
+        self.assertEqual(len(report_files), 1)
+        self.assertIn("Scripted Final Research Report", read_text(report_files[0]))
+        report_prompts = [call for call in provider.structured_calls if call["schema_name"] == "research_final_report"]
+        self.assertEqual(len(report_prompts), 1)
+        self.assertIn(proof, report_prompts[0]["messages"][0]["content"])
+
+    def test_final_report_feature_can_be_disabled(self):
+        self.app.config.agent.research_final_report_enabled = False
+        claim = "The scripted disabled-report theorem holds."
+        proof = "Complete proof: the disabled-report theorem follows from the verified local branch."
+        provider = ResearchWorkflowProvider(
+            [
+                {
+                    "response": ProviderResponse(
+                        content="",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="verify_overall",
+                                arguments={
+                                    "project_slug": self.state.project_slug,
+                                    "scope": "final",
+                                    "claim": claim,
+                                    "proof": proof,
+                                },
+                                call_id="call-disabled-report-final",
+                            )
+                        ],
+                    )
+                },
+                {
+                    "chunks": ["Final theorem verified without report generation."],
+                    "response": ProviderResponse(content="Final theorem verified without report generation."),
+                },
+            ],
+            [
+                json.dumps(self._dimension_review(reviewer_id="assumption-usage-reviewer", dimension="assumption", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="calculation-consistency-reviewer", dimension="computation", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="logical-chain-reviewer", dimension="logic", verdict="correct")),
+            ],
+            archive_responses=[
+                {
+                    "records": [
+                        {
+                            "type": "project_result",
+                            "title": "Disabled report final theorem",
+                            "content": "The final theorem passed final verification while report generation was disabled.",
+                        }
+                    ]
+                }
+            ],
+        )
+        self.app.provider = provider
+        self.app.verification_provider = provider
+        self.app.archival_provider = provider
+        self.app.agent.provider = provider
+        self.app.agent.verification_provider = provider
+        self.app.agent.archival_provider = provider
+        self.app.agent.research_workflow.provider = provider
+
+        events = list(self.app.ask_stream("Verify the final scripted theorem without a report.", self.state))
+        status_texts = [event.text for event in events if event.type == "status"]
+        report_files = list(self.app.paths.project_reports_dir(self.state.project_slug).glob("*.md"))
+        report_prompts = [call for call in provider.structured_calls if call["schema_name"] == "research_final_report"]
+
+        self.assertFalse(any("Generating final research report" in item for item in status_texts))
+        self.assertFalse(any("Final research report written" in item for item in status_texts))
+        self.assertTrue(any("Final research report generation is disabled" in item for item in status_texts))
+        self.assertEqual(report_prompts, [])
+        self.assertEqual(report_files, [])
+        self.assertTrue(self.app._research_report_offset_file(self.state).exists())
+        self.assertFalse(dict(self.state.research_report_offsets).get("pending_final_report"))
+        self.assertFalse(dict(self.state.research_report_offsets).get("final_answer"))
+
+    def test_disabling_final_report_preserves_existing_pending_offset_for_later_reenable(self):
+        first_offsets = dict(self.app._ensure_research_report_offsets(self.state))
+        self.assertTrue(self.app._research_report_offset_file(self.state).exists())
+        self.app.session_store.append_message(self.state.session_id, "user", "Progress before disabling report generation.")
+
+        disabled_app = MoonshineApp(home=self.temp_dir.name)
+        disabled_app.config.agent.research_final_report_enabled = False
+        disabled_state = disabled_app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        provider = ResearchWorkflowProvider(
+            [
+                {
+                    "chunks": ["Report generation disabled for this turn."],
+                    "response": ProviderResponse(content="Report generation disabled for this turn."),
+                }
+            ],
+            [],
+        )
+        disabled_app.provider = provider
+        disabled_app.archival_provider = provider
+        disabled_app.agent.provider = provider
+        disabled_app.agent.archival_provider = provider
+        disabled_app.agent.research_workflow.provider = provider
+
+        list(disabled_app.ask_stream("Continue while report generation is disabled.", disabled_state))
+        self.assertTrue(disabled_app._research_report_offset_file(disabled_state).exists())
+
+        resumed_app = MoonshineApp(home=self.temp_dir.name)
+        resumed_state = resumed_app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        resumed_offsets = dict(resumed_app._ensure_research_report_offsets(resumed_state))
+        self.assertEqual(resumed_offsets["messages"], first_offsets["messages"])
+        self.assertEqual(resumed_offsets["tool_events"], first_offsets["tool_events"])
+        self.assertEqual(resumed_offsets["research_log"], first_offsets["research_log"])
+
+    def test_disabled_final_report_still_creates_offset_for_later_reenable(self):
+        self.app.config.agent.research_final_report_enabled = False
+        provider = ResearchWorkflowProvider(
+            [
+                {
+                    "chunks": ["Progress while report generation starts disabled."],
+                    "response": ProviderResponse(content="Progress while report generation starts disabled."),
+                }
+            ],
+            [],
+        )
+        self.app.provider = provider
+        self.app.archival_provider = provider
+        self.app.agent.provider = provider
+        self.app.agent.archival_provider = provider
+        self.app.agent.research_workflow.provider = provider
+
+        list(self.app.ask_stream("Work while final report generation is disabled.", self.state))
+        disabled_offsets = dict(self.app._load_research_report_offsets(self.state))
+        self.assertTrue(disabled_offsets)
+        self.assertEqual(disabled_offsets["messages"], 0)
+        self.assertEqual(disabled_offsets["tool_events"], 0)
+        self.assertEqual(disabled_offsets["research_log"], 0)
+
+        resumed_app = MoonshineApp(home=self.temp_dir.name)
+        resumed_state = resumed_app.start_shell_state(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        resumed_offsets = dict(resumed_app._ensure_research_report_offsets(resumed_state))
+        self.assertEqual(resumed_offsets["messages"], 0)
+        self.assertEqual(resumed_offsets["tool_events"], 0)
+        self.assertEqual(resumed_offsets["research_log"], 0)
+        report_prompt = resumed_app.agent.research_workflow._build_final_report_prompt(
+            project_slug=resumed_state.project_slug,
+            session_id=resumed_state.session_id,
+            offsets=resumed_offsets,
+        )
+        self.assertIn("Progress while report generation starts disabled.", report_prompt)
+
+    def test_final_report_not_generated_and_offsets_kept_when_archival_goes_offline(self):
+        class FailingArchivalProvider(object):
+            def generate_structured(self, **kwargs):
+                raise RuntimeError("archival provider offline")
+
+        claim = "The final theorem passes before archival failure."
+        proof = "Complete proof: the theorem is verified, but archival fails afterward."
+        main_provider = ScriptedProvider(
+            [
+                {
+                    "response": ProviderResponse(
+                        content="",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="verify_overall",
+                                arguments={
+                                    "project_slug": self.state.project_slug,
+                                    "scope": "final",
+                                    "claim": claim,
+                                    "proof": proof,
+                                },
+                                call_id="call-final-before-archival-offline",
+                            )
+                        ],
+                    )
+                },
+                {
+                    "chunks": ["Final theorem verified before archival failure."],
+                    "response": ProviderResponse(content="Final theorem verified before archival failure."),
+                },
+            ]
+        )
+        verification_provider = ResearchWorkflowProvider(
+            [],
+            [
+                json.dumps(self._dimension_review(reviewer_id="assumption-usage-reviewer", dimension="assumption", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="calculation-consistency-reviewer", dimension="computation", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="logical-chain-reviewer", dimension="logic", verdict="correct")),
+            ],
+        )
+        self.app.config.archival_provider.inherit_from_main = False
+        self.app.config.verification_provider.inherit_from_main = False
+        self.app.provider = main_provider
+        self.app.verification_provider = verification_provider
+        self.app.archival_provider = FailingArchivalProvider()
+        self.app.agent.provider = main_provider
+        self.app.agent.verification_provider = verification_provider
+        self.app.agent.archival_provider = self.app.archival_provider
+        self.app.agent.research_workflow.provider = self.app.archival_provider
+
+        events = list(self.app.ask_stream("Verify, then hit archival offline.", self.state))
+        final_events = [event for event in events if event.type == "final"]
+        status_texts = [event.text for event in events if event.type == "status"]
+
+        self.assertEqual(final_events[-1].payload["reason"], "archival_provider_offline")
+        self.assertTrue(any("archival provider is offline or unavailable" in item for item in status_texts))
+        self.assertFalse(any("Generating final research report" in item for item in status_texts))
+        self.assertEqual(list(self.app.paths.project_reports_dir(self.state.project_slug).glob("*.md")), [])
+        self.assertTrue(self.app._research_report_offset_file(self.state).exists())
+        self.assertEqual(self.state.research_report_offsets.get("messages"), 0)
+        self.assertEqual(self.state.research_report_offsets.get("tool_events"), 0)
+        self.assertEqual(self.state.research_report_offsets.get("research_log"), 0)
+
+    def test_final_report_failure_keeps_offsets_for_retry(self):
+        class ArchiveSucceedsReportFailsProvider(object):
+            def __init__(self):
+                self.calls = []
+
+            def generate_structured(self, *, system_prompt, messages, response_schema, schema_name):
+                self.calls.append({"schema_name": schema_name, "messages": [dict(item) for item in messages]})
+                if schema_name == "research_turn_archive":
+                    return {
+                        "records": [
+                            {
+                                "type": "project_result",
+                                "title": "Report failure final theorem",
+                                "content": "The theorem passed final verification, but report generation failed.",
+                            }
+                        ]
+                    }
+                if schema_name == "research_final_report":
+                    raise RuntimeError("report provider offline")
+                raise AssertionError("unexpected schema: %s" % schema_name)
+
+        claim = "The final theorem passes before report failure."
+        proof = "Complete proof: final verification passes, then only report generation fails."
+        main_provider = ScriptedProvider(
+            [
+                {
+                    "response": ProviderResponse(
+                        content="",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="verify_overall",
+                                arguments={
+                                    "project_slug": self.state.project_slug,
+                                    "scope": "final",
+                                    "claim": claim,
+                                    "proof": proof,
+                                },
+                                call_id="call-final-before-report-failure",
+                            )
+                        ],
+                    )
+                },
+                {
+                    "chunks": ["Final theorem verified before report failure."],
+                    "response": ProviderResponse(content="Final theorem verified before report failure."),
+                },
+            ]
+        )
+        verification_provider = ResearchWorkflowProvider(
+            [],
+            [
+                json.dumps(self._dimension_review(reviewer_id="assumption-usage-reviewer", dimension="assumption", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="calculation-consistency-reviewer", dimension="computation", verdict="correct")),
+                json.dumps(self._dimension_review(reviewer_id="logical-chain-reviewer", dimension="logic", verdict="correct")),
+            ],
+        )
+        archival_provider = ArchiveSucceedsReportFailsProvider()
+        self.app.provider = main_provider
+        self.app.verification_provider = verification_provider
+        self.app.archival_provider = archival_provider
+        self.app.config.verification_provider.inherit_from_main = False
+        self.app.config.archival_provider.inherit_from_main = True
+        self.app.agent.provider = main_provider
+        self.app.agent.verification_provider = verification_provider
+        self.app.agent.archival_provider = archival_provider
+        self.app.agent.research_workflow.provider = archival_provider
+
+        events = list(self.app.ask_stream("Verify, then fail final report generation.", self.state))
+        status_texts = [event.text for event in events if event.type == "status"]
+
+        self.assertTrue(any("Final research report generation failed" in item for item in status_texts))
+        self.assertEqual(list(self.app.paths.project_reports_dir(self.state.project_slug).glob("*.md")), [])
+        self.assertTrue(self.app._research_report_offset_file(self.state).exists())
+        self.assertEqual(self.state.research_report_offsets.get("messages"), 0)
+        self.assertEqual(self.state.research_report_offsets.get("tool_events"), 0)
+        self.assertEqual(self.state.research_report_offsets.get("research_log"), 0)
+        self.assertEqual(
+            [call["schema_name"] for call in archival_provider.calls],
+            ["research_turn_archive", "research_final_report", "research_final_report", "research_final_report"],
+        )
+
     def test_default_agent_rules_template_describes_executable_closure(self):
         self.assertIn("You are Moonshine", DEFAULT_AGENT_RULES_MD)
         self.assertIn("Let actual tool calls carry memory, knowledge, file, and research-state updates.", DEFAULT_AGENT_RULES_MD)
@@ -456,7 +1169,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertTrue(results)
         self.assertEqual(results[0]["metadata"]["reasoning_content"], "REASONING_SEARCH_SENTINEL appears only in reasoning metadata.")
 
-    def test_query_session_records_searches_plain_and_archived_raw_records(self):
+    def test_query_session_records_searches_plain_raw_records_and_reports_archive_locations(self):
         self.app.ask("Record RAW_RECORD_SENTINEL in the raw session transcript.", self.state)
         archive_dir = self.app.paths.session_provider_round_archives_dir(self.state.session_id)
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -474,18 +1187,12 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             {"query": "RAW_RECORD_SENTINEL", "limit": 5},
             runtime,
         )
-        archive_payload = self.app.tool_manager.dispatch(
-            "query_session_records",
-            {"query": "ARCHIVE_SENTINEL", "limit": 5},
-            runtime,
-        )
-
-        self.assertTrue(plain_payload["hits"])
+        self.assertTrue(plain_payload["results"])
         self.assertIn("messages", plain_payload["raw_record_locations"])
         self.assertIn("provider_round_archives", plain_payload["raw_record_locations"])
-        self.assertTrue(any("RAW_RECORD_SENTINEL" in item["excerpt"] for item in plain_payload["hits"]))
-        self.assertTrue(any(item["source"] == "provider_round_archive" for item in archive_payload["hits"]))
-        self.assertTrue(any("ARCHIVE_SENTINEL" in item["excerpt"] for item in archive_payload["hits"]))
+        self.assertTrue(
+            any("RAW_RECORD_SENTINEL" in json.dumps(item, ensure_ascii=False) for item in plain_payload["results"])
+        )
 
     def test_query_session_records_searches_reasoning_content_in_raw_messages(self):
         self.app.session_store.append_message(
@@ -506,8 +1213,10 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             runtime,
         )
 
-        self.assertTrue(payload["hits"])
-        self.assertTrue(any("RAW_REASONING_RECORD_SENTINEL" in item["excerpt"] for item in payload["hits"]))
+        self.assertTrue(payload["results"])
+        self.assertTrue(
+            any("RAW_REASONING_RECORD_SENTINEL" in json.dumps(item, ensure_ascii=False) for item in payload["results"])
+        )
 
     def test_query_session_records_returns_non_retrieval_tool_results(self):
         self.app.session_store.append_tool_event(
@@ -549,12 +1258,11 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             runtime,
         )
 
-        self.assertTrue(keep_payload["matched_tool_results"])
-        self.assertIn("TOOL_RESULT_KEEP_SENTINEL", keep_payload["tool_results_content"])
-        self.assertEqual(keep_payload["tool_results_retrieval"]["source_unit"], "complete_tool_result")
-        self.assertIn("query_memory", keep_payload["tool_results_retrieval"]["excluded_tools"])
-        self.assertFalse(skip_payload["matched_tool_results"])
-        self.assertNotIn("TOOL_RESULT_SKIP_SENTINEL", skip_payload["tool_results_content"])
+        self.assertTrue(keep_payload["results"])
+        self.assertIn("TOOL_RESULT_KEEP_SENTINEL", json.dumps(keep_payload["results"], ensure_ascii=False))
+        self.assertFalse(skip_payload["results"])
+        self.assertNotIn("TOOL_RESULT_SKIP_SENTINEL", json.dumps(skip_payload["results"], ensure_ascii=False))
+        self.assertTrue(skip_payload["recovery_refs"]["retrieval_tool_refs"])
 
     def test_tool_events_jsonl_is_manifest_and_full_payload_is_archived(self):
         large_output = "ARCHIVED_TOOL_SENTINEL " + ("x" * 5000)
@@ -603,19 +1311,16 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             },
         )
 
-        with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
-            rows = connection.execute(
-                """
-                SELECT tool, search_text, metadata_json FROM tool_events
-                WHERE session_id = ?
-                """,
-                (self.state.session_id,),
-            ).fetchall()
-        rendered = json.dumps([tuple(row) for row in rows], ensure_ascii=False)
+        records = self.app.session_store.search_session_records(
+            "TOOL_INDEX_KEEP_SENTINEL",
+            session_id=self.state.session_id,
+            limit=5,
+        )
+        rendered = json.dumps(records, ensure_ascii=False)
 
         self.assertIn("run_python_script", rendered)
         self.assertIn("TOOL_INDEX_KEEP_SENTINEL", rendered)
-        self.assertTrue(any(json.loads(row[2]).get("index_version") == 2 for row in rows))
+        self.assertTrue(any(item.get("record_type") == "tool_interaction" for item in records))
         self.assertNotIn("TOOL_INDEX_SKIP_SENTINEL", rendered)
 
         runtime = self.app.agent._build_runtime(
@@ -629,8 +1334,8 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             runtime,
         )
 
-        self.assertTrue(payload["matched_tool_results"])
-        self.assertIn("TOOL_INDEX_KEEP_SENTINEL", payload["tool_results_content"])
+        self.assertTrue(payload["results"])
+        self.assertIn("TOOL_INDEX_KEEP_SENTINEL", json.dumps(payload["results"], ensure_ascii=False))
 
     def test_tool_event_search_filters_stale_indexed_retrieval_tool_rows(self):
         self.app.session_store.db.upsert_tool_event_index(
@@ -654,6 +1359,16 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             status="ok",
             search_text="NORMAL_TOOL_INDEX_SENTINEL",
             metadata_json=json.dumps({"index_version": 2}, ensure_ascii=False),
+        )
+        self.app.session_store.append_tool_event(
+            self.state.session_id,
+            {
+                "tool": "run_python_script",
+                "call_id": "call-normal-tool-record",
+                "arguments": {"path": "experiments/check.py"},
+                "output": {"stdout": "NORMAL_TOOL_INDEX_SENTINEL"},
+                "created_at": "2026-05-20T00:00:02Z",
+            },
         )
 
         skipped = self.app.session_store.search_tool_events(
@@ -727,12 +1442,14 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
             row = connection.execute(
                 """
-                SELECT metadata_json FROM tool_events
-                WHERE session_id = ? AND event_id = ?
+                SELECT metadata_json FROM session_records
+                WHERE session_id = ? AND record_id = ?
                 """,
-                (self.state.session_id, "call-rebuild-index"),
+                (self.state.session_id, "tool:call-rebuild-index"),
             ).fetchone()
-        self.assertEqual(json.loads(row[0])["index_version"], 2)
+        from moonshine.storage.session_store import SESSION_RECORD_INDEX_VERSION
+
+        self.assertEqual(json.loads(row[0])["index_version"], SESSION_RECORD_INDEX_VERSION)
 
     def test_query_session_records_hard_truncates_tool_results_without_compression(self):
         import moonshine.tools.session_tools as session_tools_module
@@ -763,11 +1480,11 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             runtime,
         )
 
-        self.assertTrue(payload["matched_tool_results"])
-        self.assertEqual(payload["tool_results_retrieval"]["content_mode"], "truncated_complete_tool_result")
-        self.assertTrue(payload["tool_results_retrieval"]["truncated"])
-        self.assertIn("TOOL_TRUNCATE_SENTINEL", payload["tool_results_content"])
-        self.assertNotIn("Compressed Tool Result Chunk", payload["tool_results_content"])
+        self.assertTrue(payload["results"])
+        self.assertTrue(payload["recovery_refs"]["truncated"])
+        rendered_results = json.dumps(payload["results"], ensure_ascii=False)
+        self.assertIn("TOOL_TRUNCATE_SENTINEL", rendered_results)
+        self.assertNotIn("Compressed Tool Result Chunk", rendered_results)
 
     def test_retrieval_tool_events_are_not_indexed_as_searchable_conversation_events(self):
         self.app.session_store.append_tool_event(
@@ -815,7 +1532,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             {"query": "INDEX_KEEP_SENTINEL", "limit": 5},
             runtime,
         )
-        self.assertIn("INDEX_KEEP_SENTINEL", payload["tool_results_content"])
+        self.assertIn("INDEX_KEEP_SENTINEL", json.dumps(payload["results"], ensure_ascii=False))
 
     def test_legacy_retrieval_tool_events_are_filtered_from_event_search(self):
         self.app.session_store.append_conversation_event(
@@ -915,9 +1632,9 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         )
         rendered = json.dumps(payload, ensure_ascii=False)
 
-        self.assertTrue(payload["tool_event_hits"])
+        self.assertTrue(payload["results"])
         self.assertIn("DIRECT_TOOL_EVENT_HIT_SENTINEL", rendered)
-        self.assertTrue(any(item["source"] == "tool-event" for item in payload["compressed_windows"]))
+        self.assertIn("tool_interaction", rendered)
 
     def test_knowledge_layer_accepts_manual_entries(self):
         response = self.app.execute_command(
@@ -1215,6 +1932,25 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertEqual(state.agent_slug, "research-control-loop")
         meta = self.app.session_store.get_session_meta(state.session_id)
         self.assertEqual(meta.get("agent_slug"), "research-control-loop")
+
+    def test_moonshine_core_research_mode_does_not_inject_problem_quality_gate(self):
+        core_state = self._build_agent_state(
+            user_message="Solve the concrete problem directly.",
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+            agent_slug="moonshine-core",
+        )
+        loop_state = self._build_agent_state(
+            user_message="Run the autonomous research workflow.",
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+            agent_slug="research-control-loop",
+        )
+
+        self.assertNotIn("Serious gate:", core_state.system_prompt)
+        self.assertIn("Serious gate:", loop_state.system_prompt)
 
     def test_selected_domain_agent_is_injected_when_explicitly_requested(self):
         system_prompt = self._build_agent_state(
@@ -2453,7 +3189,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
                             "content": active_problem,
                         },
                         {
-                            "type": "final_result",
+                            "type": "project_result",
                             "title": "Final result",
                             "content": "The finiteness criterion reduces to checks at maximal ideals, by the verified localization blueprint.",
                         },
@@ -2506,7 +3242,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertTrue(any(item["title"] == "Verified Reduction to Maximal Ideals" for item in knowledge_hits))
         self.assertTrue(any(item["type"] == "verification" for item in research_records))
         self.assertTrue(any(item["type"] == "verified_conclusion" for item in research_records))
-        self.assertTrue(any(item["type"] == "final_result" for item in research_records))
+        self.assertTrue(any(item["type"] == "project_result" for item in research_records))
 
     def test_research_mode_requires_explicit_stage_transition_section(self):
         active_problem = "Study the scripted local criterion problem."
@@ -3030,19 +3766,115 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertIn("Source refs are for auditing and recovery, not a substitute for content", archive_user_prompt)
         self.assertIn("clear, specific, and reusable form", archive_system_prompt)
         self.assertIn("exact statements, formulas, parameters, proof sketches", archive_system_prompt)
+        self.assertIn("final verification has passed", archive_system_prompt)
+        self.assertIn("verified mathematics below the whole-project final answer is verified_conclusion", archive_system_prompt)
+        self.assertIn("Important boundary: project_result versus verified_conclusion", archive_user_prompt)
+        self.assertIn("If final verification is absent, unclear, or only intermediate, do not use project_result", archive_user_prompt)
+        self.assertIn("verify_overall(scope=\"final\")", archive_user_prompt)
+        self.assertIn("Even if the counterexample was verified", archive_user_prompt)
         self.assertIn("as applicable", archive_user_prompt)
         self.assertIn("when present", archive_user_prompt)
         for record_type in [
             "problem",
             "verified_conclusion",
             "verification",
-            "final_result",
+            "project_result",
             "counterexample",
             "failed_path",
             "research_note",
         ]:
             self.assertIn(record_type, archive_system_prompt)
             self.assertIn(record_type, archive_user_prompt)
+
+    def test_research_log_migrates_legacy_final_result_type_view(self):
+        project = "anderson_conjecture"
+        log_path = self.app.paths.project_research_log_file(project)
+        append_jsonl(
+            log_path,
+            {
+                "id": "legacy-final-result-record",
+                "created_at": "2026-05-01T00:00:00Z",
+                "project_slug": project,
+                "session_id": self.state.session_id,
+                "round_id": "",
+                "type": "final_result",
+                "title": "Legacy final theorem",
+                "content": "The legacy final theorem should now appear as a project-level result.",
+                "source_refs": [],
+            },
+        )
+        legacy_path = self.app.paths.project_research_log_type_file(project, "final_result")
+        atomic_write(legacy_path, "# Final Result\n\nold generated view\n")
+
+        self.app.agent.research_workflow.research_log.rebuild_index(project)
+
+        records = self.app.agent.research_workflow.research_log.records(project)
+        raw_records = read_jsonl(log_path)
+        project_result_path = self.app.paths.project_research_log_type_file(project, "project_result")
+        self.assertTrue(any(item["type"] == "project_result" for item in records))
+        self.assertTrue(any(item["type"] == "project_result" for item in raw_records))
+        self.assertFalse(any(item["type"] == "final_result" for item in raw_records))
+        self.assertTrue(project_result_path.exists())
+        self.assertIn("Legacy final theorem", project_result_path.read_text(encoding="utf-8"))
+        self.assertFalse(legacy_path.exists())
+
+    def test_research_turn_archival_normalizes_legacy_final_result_output(self):
+        workflow = self.app.agent.research_workflow
+        provider = ArchiveOnlyProvider(
+            {
+                "records": [
+                    {
+                        "type": "final_result",
+                        "title": "Legacy model final result",
+                        "content": "A provider that ignores the new enum should still be normalized.",
+                    }
+                ]
+            }
+        )
+        workflow.provider = provider
+
+        workflow.archive_after_turn(
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+            user_message="Finalize the project.",
+            assistant_message="The project-level result is complete.",
+        )
+
+        records = read_jsonl(self.app.paths.project_research_log_file("anderson_conjecture"))
+        self.assertTrue(any(item["type"] == "project_result" for item in records))
+        self.assertFalse(any(item["type"] == "final_result" for item in records))
+
+    def test_research_turn_archival_normalizes_unknown_record_type_to_research_note(self):
+        workflow = self.app.agent.research_workflow
+        provider = ArchiveOnlyProvider(
+            {
+                "records": [
+                    {
+                        "type": "unknown_bucket",
+                        "title": "Bad archive type",
+                        "content": "This should not silently become a research_note.",
+                    }
+                ]
+            }
+        )
+        workflow.provider = provider
+
+        payload = workflow.archive_after_turn(
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+            user_message="Continue.",
+            assistant_message="Bad archive type should fail.",
+        )
+
+        records = read_jsonl(self.app.paths.project_research_log_file("anderson_conjecture"))
+        self.assertEqual(payload["archived"], 1)
+        self.assertTrue(
+            any(
+                item.get("title") == "Bad archive type"
+                and item.get("type") == "research_note"
+                for item in records
+            )
+        )
 
     def test_research_turn_archival_includes_assistant_reasoning_content(self):
         workflow = self.app.agent.research_workflow
@@ -3311,6 +4143,35 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertEqual(result["research_log_hits"][0]["type"], "failed_path")
         self.assertEqual(result["types"], ["failed_path"])
 
+    def test_query_memory_dispatch_normalizes_legacy_final_result_filter(self):
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+
+        result = self.app.tool_manager.dispatch(
+            "query_memory",
+            {"query": "project result", "types": ["final_result"]},
+            runtime,
+        )
+
+        self.assertEqual(result["scope"]["types"], ["project_result"])
+
+    def test_query_memory_dispatch_rejects_unknown_research_log_type_filter(self):
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug="anderson_conjecture",
+            session_id=self.state.session_id,
+        )
+
+        with self.assertRaises(JsonSchemaValidationError):
+            self.app.tool_manager.dispatch(
+                "query_memory",
+                {"query": "project result", "types": ["not_a_real_research_type"]},
+                runtime,
+            )
+
     def test_verified_conclusion_research_log_syncs_to_global_knowledge(self):
         self.app.agent.context_manager.research_log.append_records(
             "anderson_conjecture",
@@ -3498,7 +4359,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
                             "content": "verify_overall(scope=\"final\") passed for the scripted autonomous proof.",
                         },
                         {
-                            "type": "final_result",
+                            "type": "project_result",
                             "title": "Autonomous final result",
                             "content": "The scripted autonomous blueprint closes the argument by reducing to a verified local branch.",
                         },
@@ -4542,11 +5403,50 @@ metadata:
         self.assertIn("memory/MEMORY.md", skill_payload["file_references"])
         self.assertIn("runtime_notice", skill_payload)
         self.assertIn("memory", tool_payload["description"].lower())
+        self.assertIn("project_result", json.dumps(tool_payload["parameters"], ensure_ascii=False))
+        self.assertNotIn("final_result", json.dumps(tool_payload["parameters"], ensure_ascii=False))
         self.assertIn("Autonomous Mathematical Researcher", agent_payload["body"])
         self.assertIn("Stage 1: Problem Design", agent_payload["body"])
         self.assertNotIn("record_solve_attempt", agent_payload["body"])
         self.assertIn("autonomous mathematical researcher", agent_payload["runtime_body"])
         self.assertNotIn("moonshine:prompt", agent_payload["runtime_body"])
+
+    def test_read_runtime_file_cannot_bypass_definition_exposure(self):
+        runtime = self.app.agent._build_runtime(
+            mode="research",
+            project_slug=self.state.project_slug,
+            session_id=self.state.session_id,
+        )
+        visible_tool_path = self.app.paths.tool_definitions_dir / "query_memory.md"
+        hidden_tool_path = self.app.paths.tool_definitions_dir / "commit_turn.md"
+        visible_skill_path = self.app.paths.builtin_skills_dir / "query-memory" / "SKILL.md"
+        hidden_skill_path = self.app.paths.builtin_skills_dir / "extract-project-memory" / "SKILL.md"
+
+        visible_tool_payload = self.app.tool_manager.dispatch(
+            "read_runtime_file",
+            {"relative_path": str(visible_tool_path)},
+            runtime,
+        )
+        visible_skill_payload = self.app.tool_manager.dispatch(
+            "read_runtime_file",
+            {"relative_path": str(visible_skill_path)},
+            runtime,
+        )
+
+        self.assertIn("query_memory", visible_tool_payload["content"])
+        self.assertIn("query-memory", visible_skill_payload["content"])
+        with self.assertRaisesRegex(ValueError, "tool definition is not exposed"):
+            self.app.tool_manager.dispatch(
+                "read_runtime_file",
+                {"relative_path": str(hidden_tool_path)},
+                runtime,
+            )
+        with self.assertRaisesRegex(ValueError, "skill definition is not exposed"):
+            self.app.tool_manager.dispatch(
+                "read_runtime_file",
+                {"relative_path": str(hidden_skill_path)},
+                runtime,
+            )
 
     def test_query_memory_tool_returns_source_labeled_summary(self):
         self.app.ask("We discussed local criteria for Noetherian rings.", self.state)
@@ -6474,6 +7374,337 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
         self.assertIn("fallback_schema", captured_payloads[1]["messages"][0]["content"])
         self.assertIn('"required": [', captured_payloads[1]["messages"][0]["content"])
 
+    def test_openai_structured_generation_respects_json_object_configuration(self):
+        captured = {}
+
+        class FakeHTTPResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps({"ok": True}),
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        provider = OpenAIChatCompletionsProvider(
+            model="moonshine-test",
+            base_url="https://example.invalid/v1",
+            api_key_env="OPENAI_API_KEY",
+            timeout_seconds=7,
+            temperature=0.0,
+            stream=False,
+            structured_output_format="json_object",
+        )
+
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), mock.patch("moonshine.providers.urlopen", fake_urlopen):
+            payload = provider.generate_structured(
+                system_prompt="Return JSON.",
+                messages=[{"role": "user", "content": "Return {\"ok\": true} as JSON."}],
+                response_schema=schema,
+                schema_name="json_object_schema",
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured["payload"]["response_format"]["type"], "json_object")
+        self.assertIn("JSON mode fallback", captured["payload"]["messages"][0]["content"])
+
+    def test_openai_structured_generation_updates_callback_after_successful_fallback(self):
+        captured_payloads = []
+        chosen_formats = []
+
+        class FakeHTTPResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps({"ok": True}),
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            if len(captured_payloads) == 1:
+                raise HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        b'{"error":{"message":"response_format json_schema is unsupported","type":"invalid_request_error"}}'
+                    ),
+                )
+            return FakeHTTPResponse()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        provider = OpenAIChatCompletionsProvider(
+            model="moonshine-test",
+            base_url="https://example.invalid/v1",
+            api_key_env="OPENAI_API_KEY",
+            timeout_seconds=7,
+            temperature=0.0,
+            stream=False,
+            max_retries=0,
+            structured_output_format="json_schema",
+            structured_output_format_callback=chosen_formats.append,
+        )
+
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), mock.patch("moonshine.providers.urlopen", fake_urlopen):
+            payload = provider.generate_structured(
+                system_prompt="Return JSON.",
+                messages=[{"role": "user", "content": "Return {\"ok\": true} as JSON."}],
+                response_schema=schema,
+                schema_name="adaptive_schema",
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured_payloads[0]["response_format"]["type"], "json_schema")
+        self.assertEqual(captured_payloads[1]["response_format"]["type"], "json_object")
+        self.assertEqual(chosen_formats, ["json_object"])
+        self.assertEqual(provider.structured_output_format, "json_object")
+
+    def test_responses_structured_generation_falls_back_when_json_schema_is_rejected(self):
+        captured_payloads = []
+        chosen_formats = []
+
+        class FakeHTTPResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"output_text": json.dumps({"ok": True})}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            if len(captured_payloads) == 1:
+                raise HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        b'{"error":{"message":"json_schema is unsupported for this model","type":"invalid_request_error"}}'
+                    ),
+                )
+            return FakeHTTPResponse()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        provider = OpenAIResponsesProvider(
+            model="moonshine-test",
+            base_url="https://example.invalid/v1",
+            api_key_env="OPENAI_API_KEY",
+            timeout_seconds=7,
+            temperature=0.0,
+            stream=False,
+            max_retries=0,
+            structured_output_format="json_schema",
+            structured_output_format_callback=chosen_formats.append,
+        )
+
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), mock.patch("moonshine.providers.urlopen", fake_urlopen):
+            payload = provider.generate_structured(
+                system_prompt="Return JSON.",
+                messages=[{"role": "user", "content": "Return {\"ok\": true} as JSON."}],
+                response_schema=schema,
+                schema_name="responses_adaptive_schema",
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured_payloads[0]["text"]["format"]["type"], "json_schema")
+        self.assertEqual(captured_payloads[1]["text"]["format"]["type"], "json_object")
+        self.assertEqual(chosen_formats, ["json_object"])
+        self.assertEqual(provider.structured_output_format, "json_object")
+
+    def test_structured_format_fallback_persists_dedicated_archival_provider_config(self):
+        captured_payloads = []
+
+        class FakeHTTPResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps({"ok": True}),
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            if len(captured_payloads) == 1:
+                raise HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        b'{"error":{"message":"response_format json_schema is unsupported","type":"invalid_request_error"}}'
+                    ),
+                )
+            return FakeHTTPResponse()
+
+        self.app.update_provider_config(
+            target="archival",
+            provider_type="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="archive-model",
+            api_key_env="ARCHIVE_API_KEY",
+            structured_output_format="json_schema",
+            inherit_from_main=False,
+        )
+        self.app.config.archival_provider.max_retries = 0
+        self.app._refresh_runtime_providers()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        with mock.patch.dict("os.environ", {"ARCHIVE_API_KEY": "archive-key"}), mock.patch("moonshine.providers.urlopen", fake_urlopen):
+            payload = self.app.archival_provider.generate_structured(
+                system_prompt="Return JSON.",
+                messages=[{"role": "user", "content": "Return {\"ok\": true} as JSON."}],
+                response_schema=schema,
+                schema_name="archival_schema",
+            )
+
+        config_payload = read_json(self.app.paths.config_file, default={})
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured_payloads[1]["response_format"]["type"], "json_object")
+        self.assertEqual(self.app.config.archival_provider.structured_output_format, "json_object")
+        self.assertEqual(config_payload["archival_provider"]["structured_output_format"], "json_object")
+
+    def test_structured_format_fallback_persists_main_config_when_archival_inherits_main(self):
+        captured_payloads = []
+
+        class FakeHTTPResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps({"ok": True}),
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            if len(captured_payloads) == 1:
+                raise HTTPError(
+                    request.full_url,
+                    400,
+                    "Bad Request",
+                    hdrs=None,
+                    fp=io.BytesIO(
+                        b'{"error":{"message":"json_schema is unsupported for this model","type":"invalid_request_error"}}'
+                    ),
+                )
+            return FakeHTTPResponse()
+
+        self.app.update_provider_config(
+            target="main",
+            provider_type="openai_compatible",
+            base_url="https://example.invalid/v1",
+            model="main-model",
+            api_key_env="OPENAI_API_KEY",
+            structured_output_format="json_schema",
+        )
+        self.app.config.provider.max_retries = 0
+        self.app.config.archival_provider.inherit_from_main = True
+        self.app._refresh_runtime_providers()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), mock.patch("moonshine.providers.urlopen", fake_urlopen):
+            payload = self.app.archival_provider.generate_structured(
+                system_prompt="Return JSON.",
+                messages=[{"role": "user", "content": "Return {\"ok\": true} as JSON."}],
+                response_schema=schema,
+                schema_name="inherited_archival_schema",
+            )
+
+        config_payload = read_json(self.app.paths.config_file, default={})
+
+        self.assertIs(self.app.archival_provider, self.app.provider)
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(captured_payloads[1]["response_format"]["type"], "json_object")
+        self.assertEqual(self.app.config.provider.structured_output_format, "json_object")
+        self.assertEqual(config_payload["provider"]["structured_output_format"], "json_object")
+        self.assertTrue(config_payload["archival_provider"]["inherit_from_main"])
+
     def test_context_manager_returns_reasoning_content_from_assistant_metadata(self):
         session_id = self.app.session_store.create_session("chat", "general")
         self.app.session_store.append_message(session_id, "user", "first question")
@@ -7013,6 +8244,45 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
         self.assertEqual(config_payload["provider"]["api_key_env"], "OPENAI_API_KEY")
         self.assertTrue(config_payload["provider"]["stream"])
         self.assertEqual(config_payload["provider"]["temperature"], 0.1)
+
+    def test_provider_command_openai_responses_flag_updates_provider_type(self):
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            exit_code = cli_main(
+                [
+                    "--home",
+                    self.temp_dir.name,
+                    "provider",
+                    "--target",
+                    "main",
+                    "--openai-responses",
+                ]
+            )
+
+        config_payload = read_json(self.app.paths.config_file, default={})
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(config_payload["provider"]["type"], "openai_responses")
+        self.assertIn("Provider: openai_responses", output.getvalue())
+
+    def test_provider_type_accepts_hyphenated_openai_responses_alias(self):
+        with mock.patch("sys.stdout", io.StringIO()):
+            exit_code = cli_main(
+                [
+                    "--home",
+                    self.temp_dir.name,
+                    "provider",
+                    "--target",
+                    "main",
+                    "--type",
+                    "openai-responses",
+                ]
+            )
+
+        config_payload = read_json(self.app.paths.config_file, default={})
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(config_payload["provider"]["type"], "openai_responses")
 
     def test_provider_command_supports_incremental_verification_provider_updates(self):
         steps = [
