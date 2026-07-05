@@ -405,7 +405,7 @@ class MoonshineApp(object):
                 raise ValueError("inherit_from_main applies only to secondary providers.")
             provider_config.inherit_from_main = bool(inherit_from_main)
         if provider_type is not None:
-            normalized = str(provider_type or "").strip().lower()
+            normalized = str(provider_type or "").strip().lower().replace("-", "_")
             if not normalized:
                 raise ValueError("Provider type cannot be empty.")
             provider_config.type = normalized
