@@ -1262,6 +1262,7 @@ class AIAgent(object):
             skill_index=skill_index,
             agent_summary=agent_summary,
             agent_body=agent_body,
+            agent_slug=resolved_agent_slug,
             mcp_index=mcp_index,
             research_runtime_context=research_runtime_context,
         )

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from moonshine.json_schema import validate_json_schema
+from moonshine.agent_runtime.research_log import canonical_research_log_type
 from moonshine.markdown_metadata import load_markdown_metadata
 from moonshine.moonshine_constants import MoonshinePaths, packaged_tool_definitions_dir
 from moonshine.tools.catalog_tools import (
@@ -37,6 +38,19 @@ from moonshine.tools.verification_tools import (
     verify_correctness_logic,
     verify_overall,
 )
+
+
+def _runtime_exposure(runtime: Optional[Dict[str, object]]) -> Dict[str, object]:
+    """Return exposure settings from either a runtime dict or config object."""
+    raw = (runtime or {}).get("exposure") or {}
+    if isinstance(raw, dict):
+        return raw
+    return {
+        "tools_include": list(getattr(raw, "tools_include", []) or []),
+        "tools_exclude": list(getattr(raw, "tools_exclude", []) or []),
+        "skills_include": list(getattr(raw, "skills_include", []) or []),
+        "skills_exclude": list(getattr(raw, "skills_exclude", []) or []),
+    }
 
 
 @dataclass
@@ -212,6 +226,27 @@ class ToolRegistry(object):
         if name not in self._tools:
             raise KeyError("unknown tool: %s" % name)
         definition = self._tools[name]
+        mode = str((runtime or {}).get("mode") or "")
+        exposure = _runtime_exposure(runtime)
+        if not self._visible_in_mode(definition, mode=mode) or not self._included_by_name(
+            definition.name,
+            include=list(exposure.get("tools_include") or []),
+            exclude=list(exposure.get("tools_exclude") or []),
+        ):
+            raise RuntimeError("tool not exposed: %s" % name)
         normalized_arguments = dict(arguments or {})
+        if name == "query_memory":
+            for key in ("types", "channels"):
+                if key not in normalized_arguments:
+                    continue
+                value = normalized_arguments.get(key)
+                if not isinstance(value, list):
+                    continue
+                normalized_values = []
+                for item in value:
+                    normalized_type = canonical_research_log_type(str(item))
+                    if normalized_type and normalized_type not in normalized_values:
+                        normalized_values.append(normalized_type)
+                normalized_arguments[key] = normalized_values
         validate_json_schema(normalized_arguments, definition.parameters)
         return definition.handler(runtime, **normalized_arguments)

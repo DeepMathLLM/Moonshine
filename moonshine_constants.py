@@ -147,6 +147,8 @@ DEFAULT_CONFIG = {
         "max_consecutive_errors": 3,
         "max_tool_calls_per_round": 20,
         "research_max_iterations": 100,
+        "research_final_report_enabled": True,
+        "research_final_report_retries": 3,
         "verification_dimension_review_count": 1,
         "emit_status_events": True,
     },
@@ -509,6 +511,9 @@ class MoonshinePaths:
     def project_workspace_dir(self, project_slug: str) -> Path:
         return self.project_dir(project_slug) / "workspace"
 
+    def project_reports_dir(self, project_slug: str) -> Path:
+        return self.project_dir(project_slug) / "reports"
+
     def project_problem_draft_file(self, project_slug: str) -> Path:
         return self.project_workspace_dir(project_slug) / "problem.md"
 
@@ -626,6 +631,9 @@ class MoonshinePaths:
 
     def session_context_summaries_file(self, session_id: str) -> Path:
         return self.session_artifacts_dir(session_id) / "context_summaries.jsonl"
+
+    def session_research_report_offset_file(self, session_id: str) -> Path:
+        return self.session_artifacts_dir(session_id) / "research_report_offset.json"
 
 
 def default_config() -> Dict[str, object]:

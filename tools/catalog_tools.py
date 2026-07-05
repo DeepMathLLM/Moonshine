@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 
+def _runtime_exposure(runtime: dict) -> dict:
+    """Return exposure settings from either a runtime dict or config object."""
+    raw = (runtime or {}).get("exposure") or {}
+    if isinstance(raw, dict):
+        return raw
+    return {
+        "tools_include": list(getattr(raw, "tools_include", []) or []),
+        "tools_exclude": list(getattr(raw, "tools_exclude", []) or []),
+        "skills_include": list(getattr(raw, "skills_include", []) or []),
+        "skills_exclude": list(getattr(raw, "skills_exclude", []) or []),
+    }
+
+
 def load_skill_definition(runtime: dict, slug: str) -> dict:
     """Load the full markdown body for a skill."""
-    exposure = dict(runtime.get("exposure") or {})
+    exposure = _runtime_exposure(runtime)
     skill_manager = runtime["skill_manager"]
     if not skill_manager.is_skill_exposed(
         slug,
@@ -49,7 +62,7 @@ def load_skill_definition(runtime: dict, slug: str) -> dict:
 
 def load_tool_definition(runtime: dict, name: str) -> dict:
     """Load the full markdown body for a tool."""
-    exposure = dict(runtime.get("exposure") or {})
+    exposure = _runtime_exposure(runtime)
     tool_manager = runtime["tool_manager"]
     mode = str(runtime.get("mode") or "")
     visible = {

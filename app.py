@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 from moonshine.agents.manager import AgentManager
 from moonshine.agent_runtime.model_metadata import DEFAULT_CONTEXT_WINDOW_TOKENS, resolve_model_context_window
@@ -21,7 +21,7 @@ from moonshine.run_agent import AIAgent, AgentEvent
 from moonshine.skills.manager import SkillManager
 from moonshine.storage.session_store import SessionStore
 from moonshine.tools.manager import ToolManager
-from moonshine.utils import atomic_write, utc_now
+from moonshine.utils import atomic_write, read_json, read_jsonl, utc_now, write_json
 
 
 TAVILY_API_KEY_URL = "https://app.tavily.com/"
@@ -121,6 +121,7 @@ class ShellState:
     agent_slug: str
     auto_project_pending: bool = False
     research_autopilot_default_enabled: bool = True
+    research_report_offsets: Dict[str, object] = field(default_factory=dict)
 
 
 class MoonshineApp(object):
@@ -614,12 +615,271 @@ class MoonshineApp(object):
         state.session_id = replacement.session_id
         state.mode = replacement.mode
         state.agent_slug = replacement.agent_slug
+        state.research_report_offsets = {}
         return {
             "changed": True,
             "project_slug": state.project_slug,
             "session_id": state.session_id,
             "previous_session_id": previous_session_id,
         }
+
+    def _jsonl_count(self, path: Path) -> int:
+        """Return a safe JSONL record count for offset tracking."""
+        return len(read_jsonl(path))
+
+    def _research_final_report_enabled(self) -> bool:
+        """Return whether verified-run report generation is enabled."""
+        return bool(getattr(self.config.agent, "research_final_report_enabled", True))
+
+    def _research_report_offset_key(self, state: ShellState) -> str:
+        """Return the stable key for the current project/session report window."""
+        return "%s:%s" % (state.project_slug, state.session_id)
+
+    def _research_report_offset_file(self, state: ShellState) -> Path:
+        """Return the persisted report-offset file for this session."""
+        return self.paths.session_research_report_offset_file(state.session_id)
+
+    def _load_research_report_offsets(self, state: ShellState) -> Dict[str, object]:
+        """Load persisted report offsets for this project/session."""
+        path = self._research_report_offset_file(state)
+        try:
+            payload = read_json(path, default={}) or {}
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        current_key = self._research_report_offset_key(state)
+        if str(payload.get("key") or "") != current_key:
+            return {}
+        if str(payload.get("project_slug") or "") != state.project_slug:
+            return {}
+        if str(payload.get("session_id") or "") != state.session_id:
+            return {}
+        return dict(payload)
+
+    def _persist_research_report_offsets(self, state: ShellState, offsets: Dict[str, object]) -> None:
+        """Persist report offsets so failed report generation survives restart."""
+        payload = dict(offsets or {})
+        if not payload:
+            return
+        payload.setdefault("created_at", utc_now())
+        payload["updated_at"] = utc_now()
+        write_json(self._research_report_offset_file(state), payload)
+
+    def _ensure_research_report_offsets(self, state: ShellState) -> Dict[str, object]:
+        """Create a persistent report offset for the current research run."""
+        if state.mode != "research" or state.auto_project_pending:
+            return {}
+        current_key = self._research_report_offset_key(state)
+        if str(state.research_report_offsets.get("key") or "") == current_key:
+            if self._research_report_offset_file(state).exists():
+                return state.research_report_offsets
+            state.research_report_offsets = {}
+        persisted = self._load_research_report_offsets(state)
+        if persisted:
+            state.research_report_offsets = persisted
+            return persisted
+        offsets = {
+            "key": current_key,
+            "project_slug": state.project_slug,
+            "session_id": state.session_id,
+            "messages": self._jsonl_count(self.paths.session_messages_file(state.session_id)),
+            "tool_events": self._jsonl_count(self.paths.session_tool_events_file(state.session_id)),
+            "research_log": self._jsonl_count(self.paths.project_research_log_file(state.project_slug)),
+            "created_at": utc_now(),
+        }
+        state.research_report_offsets = offsets
+        self._persist_research_report_offsets(state, offsets)
+        return offsets
+
+    def _clear_research_report_offsets(self, state: ShellState) -> None:
+        """Clear report offsets after a final report has been written."""
+        state.research_report_offsets = {}
+        try:
+            self._research_report_offset_file(state).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _project_research_report_offset_payloads(self, state: ShellState) -> List[Dict[str, object]]:
+        """Return pending report offsets for all sessions in the current project."""
+        rows: List[Dict[str, object]] = []
+        seen = set()
+        for path in self.paths.sessions_dir.glob("*/artifacts/research_report_offset.json"):
+            try:
+                payload = read_json(path, default={}) or {}
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("project_slug") or "") != state.project_slug:
+                continue
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            if str(payload.get("key") or "") != "%s:%s" % (state.project_slug, session_id):
+                continue
+            payload = dict(payload)
+            payload["_offset_path"] = str(path)
+            rows.append(payload)
+            seen.add(session_id)
+        current = dict(state.research_report_offsets or {})
+        current_session = str(current.get("session_id") or "").strip()
+        if current_session and str(current.get("project_slug") or "") == state.project_slug and current_session not in seen:
+            rows.append(current)
+        rows.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("session_id") or "")))
+        return rows
+
+    def _final_report_generation_offsets(self, state: ShellState, offsets: Dict[str, object]) -> Dict[str, object]:
+        """Combine all pending project/session offsets for one project-level report."""
+        base = dict(offsets or {})
+        pending = self._project_research_report_offset_payloads(state)
+        if not pending and base:
+            pending = [base]
+        session_windows = []
+        research_log_offsets = []
+        for item in pending:
+            session_id = str(item.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            session_windows.append(
+                {
+                    "session_id": session_id,
+                    "messages": int(item.get("messages") or 0),
+                    "tool_events": int(item.get("tool_events") or 0),
+                }
+            )
+            try:
+                research_log_offsets.append(max(0, int(item.get("research_log") or 0)))
+            except (TypeError, ValueError):
+                pass
+        if session_windows:
+            base["pending_sessions"] = session_windows
+        if research_log_offsets:
+            base["research_log"] = min(research_log_offsets)
+        return base
+
+    def _clear_project_research_report_offsets(self, state: ShellState) -> None:
+        """Clear all pending report offsets for this project after a project report is written."""
+        for payload in self._project_research_report_offset_payloads(state):
+            path_text = str(payload.get("_offset_path") or "").strip()
+            if not path_text:
+                continue
+            try:
+                Path(path_text).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        state.research_report_offsets = {}
+
+    def _is_final_verification_passed_event(self, event: AgentEvent) -> bool:
+        """Return True when an event is a passing final verify_overall result."""
+        if event.type != "tool_result" or event.text != "verify_overall":
+            return False
+        try:
+            output = dict(event.payload.get("output") or {})
+        except (TypeError, ValueError):
+            return False
+        scope = str(output.get("scope") or "").strip().lower()
+        return bool(output.get("passed")) and scope == "final"
+
+    def _generate_final_research_report_with_provider(
+        self,
+        provider,
+        *,
+        project_slug: str,
+        session_id: str,
+        offsets: Dict[str, object],
+        retries: int,
+    ) -> Dict[str, object]:
+        """Run final report generation with a selected provider."""
+        workflow = self.agent.research_workflow
+        previous_provider = workflow.provider
+        workflow.provider = provider
+        try:
+            return workflow.generate_final_report(
+                project_slug=project_slug,
+                session_id=session_id,
+                offsets=offsets,
+                retries=retries,
+            )
+        finally:
+            workflow.provider = previous_provider
+
+    def _final_report_failed(self, payload: Dict[str, object]) -> bool:
+        """Return whether a final report generation payload represents failure."""
+        return not bool(payload.get("written")) or bool(payload.get("error") or payload.get("skipped"))
+
+    def _emit_final_research_report_events(self, state: ShellState):
+        """Generate the user-facing research report after final verification passes."""
+        if not self._research_final_report_enabled():
+            yield AgentEvent(
+                type="status",
+                text="Final research report generation is disabled; report offset retained.",
+                payload={"project_slug": state.project_slug, "session_id": state.session_id},
+            )
+            return
+        offsets = dict(state.research_report_offsets or {})
+        if not offsets:
+            offsets = self._ensure_research_report_offsets(state)
+        if not offsets:
+            return
+        offsets = self._final_report_generation_offsets(state, offsets)
+        retries = max(1, int(getattr(self.config.agent, "research_final_report_retries", 3) or 3))
+        yield AgentEvent(
+            type="status",
+            text="Generating final research report from the verified run.",
+            payload={"project_slug": state.project_slug, "session_id": state.session_id},
+        )
+        payload = self._generate_final_research_report_with_provider(
+            self.archival_provider,
+            project_slug=state.project_slug,
+            session_id=state.session_id,
+            offsets=offsets,
+            retries=retries,
+        )
+        archival_inherits_main = bool(getattr(self.config.archival_provider, "inherit_from_main", True))
+        if (
+            self._final_report_failed(dict(payload or {}))
+            and not archival_inherits_main
+            and self.archival_provider is not self.provider
+        ):
+            yield AgentEvent(
+                type="status",
+                text="Dedicated archival provider failed while generating the final research report; retrying with the main provider.",
+                payload={"project_slug": state.project_slug, "error": dict(payload or {}).get("error") or dict(payload or {}).get("skipped")},
+            )
+            fallback_payload = self._generate_final_research_report_with_provider(
+                self.provider,
+                project_slug=state.project_slug,
+                session_id=state.session_id,
+                offsets=offsets,
+                retries=retries,
+            )
+            fallback_payload = dict(fallback_payload or {})
+            fallback_payload["fallback_provider"] = "main"
+            fallback_payload["primary_archival_error"] = {
+                key: value
+                for key, value in dict(payload or {}).items()
+                if key in {"error", "skipped", "written"}
+            }
+            payload = fallback_payload
+        payload = dict(payload or {})
+        if payload.get("written"):
+            self._clear_project_research_report_offsets(state)
+            yield AgentEvent(
+                type="status",
+                text="Final research report written: %s" % str(payload.get("report_path") or ""),
+                payload={"research_report": payload},
+            )
+            return
+        yield AgentEvent(
+            type="status",
+            text="Final research report generation failed: %s" % str(payload.get("error") or payload.get("skipped") or "unknown failure"),
+            payload={"research_report": payload},
+        )
 
     def stage_input_file(self, source_path: str, *, project_slug: str = "") -> dict:
         """Make an external text input readable through read_runtime_file."""
@@ -667,27 +927,38 @@ class MoonshineApp(object):
 
     def ask(self, user_message: str, state: ShellState) -> str:
         """Run one user turn."""
-        if state.auto_project_pending:
-            self.prepare_research_project(user_message, state, allow_user_choice=False)
-        return self.agent.run_conversation(
-            user_message=user_message,
-            mode=state.mode,
-            project_slug=state.project_slug,
-            session_id=state.session_id,
-            agent_slug=state.agent_slug,
-        )
+        final_text = ""
+        for event in self.ask_stream(user_message, state):
+            if event.type == "final":
+                final_text = str(event.text or "")
+        return final_text
 
     def ask_stream(self, user_message: str, state: ShellState):
         """Stream one user turn as agent events."""
         if state.auto_project_pending:
             self.prepare_research_project(user_message, state, allow_user_choice=False)
-        return self.agent.run_conversation_events(
+        self._ensure_research_report_offsets(state)
+        if self._research_final_report_enabled():
+            if not state.research_report_offsets:
+                self._ensure_research_report_offsets(state)
+        final_verification_passed = False
+        for event in self.agent.run_conversation_events(
             user_message=user_message,
             mode=state.mode,
             project_slug=state.project_slug,
             session_id=state.session_id,
             agent_slug=state.agent_slug,
-        )
+        ):
+            if self._is_final_verification_passed_event(event):
+                final_verification_passed = True
+            if event.type == "final" and final_verification_passed and str(event.payload.get("reason") or "") not in {
+                "provider_offline",
+                "verification_provider_offline",
+                "archival_provider_offline",
+            }:
+                for report_event in self._emit_final_research_report_events(state):
+                    yield report_event
+            yield event
 
     def run_research_autopilot_events(self, initial_prompt: str, state: ShellState, *, max_iterations: int = 100):
         """Run Research Mode as repeated conversation turns until budget exhaustion."""

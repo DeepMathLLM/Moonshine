@@ -161,7 +161,8 @@ def _matched_tool_results(
 
 def list_sessions(runtime: dict, limit: int = 10) -> dict:
     """List recent sessions."""
-    return {"sessions": runtime["session_store"].list_sessions(limit=limit)}
+    max_sessions = min(100, max(1, int(limit or 10)))
+    return {"sessions": runtime["session_store"].list_sessions(limit=max_sessions)}
 
 
 def search_sessions(runtime: dict, query: str, project_slug: str = "") -> dict:
@@ -182,7 +183,7 @@ def query_session_records(runtime: dict, query: str, session_id: str = "", limit
     if not needle:
         raise ValueError("query cannot be empty")
 
-    max_hits = max(1, int(limit or 8))
+    max_hits = min(50, max(1, int(limit or 8)))
     session_store = runtime["session_store"]
     record_hits = session_store.search_session_records(query, limit=max_hits, session_id=target_session)
 

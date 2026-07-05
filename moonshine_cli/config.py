@@ -160,6 +160,8 @@ class AgentConfig:
     max_consecutive_errors: int = int(_config_value("agent", "max_consecutive_errors"))
     max_tool_calls_per_round: int = int(_config_value("agent", "max_tool_calls_per_round"))
     research_max_iterations: int = int(_config_value("agent", "research_max_iterations"))
+    research_final_report_enabled: bool = bool(_config_value("agent", "research_final_report_enabled"))
+    research_final_report_retries: int = int(_config_value("agent", "research_final_report_retries"))
     verification_dimension_review_count: int = int(_config_value("agent", "verification_dimension_review_count"))
     emit_status_events: bool = bool(_config_value("agent", "emit_status_events"))
 
@@ -324,6 +326,8 @@ def render_core_config_yaml(config: AppConfig) -> str:
         "  max_tool_rounds: %s" % config.agent.max_tool_rounds,
         "  max_tool_calls_per_round: %s" % config.agent.max_tool_calls_per_round,
         "  research_max_iterations: %s" % config.agent.research_max_iterations,
+        "  research_final_report_enabled: %s" % str(config.agent.research_final_report_enabled).lower(),
+        "  research_final_report_retries: %s" % config.agent.research_final_report_retries,
         "exposure:",
         "  tools_include: %s" % json.dumps(config.exposure.tools_include, ensure_ascii=False),
         "  tools_exclude: %s" % json.dumps(config.exposure.tools_exclude, ensure_ascii=False),
@@ -385,6 +389,7 @@ def ensure_project_layout(paths: MoonshinePaths, project_slug: str) -> None:
     """Ensure the on-disk structure for a project exists."""
     ensure_directory(paths.project_dir(project_slug))
     ensure_directory(paths.project_workspace_dir(project_slug))
+    ensure_directory(paths.project_reports_dir(project_slug))
     ensure_directory(paths.project_dir(project_slug) / "memory")
     ensure_directory(paths.project_references_dir(project_slug))
     ensure_directory(paths.project_reference_papers_dir(project_slug))
