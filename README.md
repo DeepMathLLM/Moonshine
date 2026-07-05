@@ -98,9 +98,13 @@ record.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+ for the full dependency set
+- Python 3.10 or 3.11 recommended, especially on Windows
 - A terminal environment
 - An LLM provider for live model calls
+
+Python 3.8 is not recommended for a full `.[all]` install because some optional
+runtime dependencies require Python 3.9 or newer.
 
 Offline mode is available for inspecting the CLI and runtime layout without an
 API key.
@@ -120,10 +124,12 @@ From the repository root:
 python -m pip install -e ".[all]" --no-build-isolation
 ```
 
-Optional but recommended before installation:
+If installation fails with a build-tool error such as missing `wheel` or
+`bdist_wheel`, update the local build tools and retry:
 
 ```bash
 python -m pip install -U pip setuptools wheel
+python -m pip install -e ".[all]" --no-build-isolation
 ```
 
 ### 2. Initialize a runtime home
@@ -918,6 +924,11 @@ MCP descriptors connect external tools to Moonshine. The built-in filesystem
 descriptor gives project-scoped file access. Tavily adds live web search and
 page extraction, useful for recent references, literature checks, and reading
 web pages during research.
+
+Tavily is an external search API for agentic web search, retrieval, and page
+extraction. Its website is <https://www.tavily.com/>. To use Tavily with
+Moonshine, create a Tavily API key from the Tavily website or dashboard, then
+store it with Moonshine using the setup command below.
 
 List MCP descriptors:
 
