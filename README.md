@@ -35,8 +35,50 @@ record.
 - Project-local Python script execution and package installation tools.
 - Exposure controls for selecting which skills and tools are visible.
 
+## Latest Updates
+
+### 2026-07
+
+- Added automatic project-level final research report generation after
+  `verify_overall(scope="final")` passes.
+- Added non-overwriting Markdown reports under `projects/<project>/reports/`.
+- Added continuation from the latest previous report so each new report begins
+  with a clear summary of prior project progress.
+- Added cross-session pending report windows for project-level reports, so
+  unfinished reporting work from earlier sessions can be included in a later
+  session's final report.
+- Added report retry and enable/disable controls.
+
+### 2026-06
+
+- Added OpenAI Responses provider support.
+- Added reasoning effort and reasoning summary configuration.
+- Added dedicated archival provider configuration.
+- Added archival fallback to the main provider.
+- Added structured-output support for Responses-based verification and archival.
+- Added project-local Python script execution.
+- Added Python package installation for project scripts.
+- Improved compatibility for assistant `reasoning_content` in session history.
+- Improved session continuation with reasoning and visible assistant content.
+
+### 2026-05
+
+- Added typed project research logs.
+- Added `research_log.jsonl`, readable `research_log.md`, by-type Markdown files,
+  and `research_log_index.sqlite`.
+- Added unified session-record retrieval.
+- Added indexed tool-event retrieval.
+- Added recovery references for large archived tool payloads.
+- Added query-time backfill for older session files.
+- Added `query_session_records` for exact raw session recovery.
+- Added exposure controls for skills and tools.
+- Added Usage Hint loading from skill and tool Markdown files.
+- Added Tavily MCP setup commands.
+- Improved research-mode provider failure handling.
+
 ## Contents
 
+- [Latest Updates](#latest-updates)
 - [Requirements](#requirements)
 - [From Install to First Run](#from-install-to-first-run)
 - [Runtime Home](#runtime-home)
@@ -51,7 +93,6 @@ record.
 - [Skills, Tools, Agents, and MCP](#skills-tools-agents-and-mcp)
 - [Python Tools](#python-tools)
 - [Runtime Layout](#runtime-layout)
-- [Latest Updates](#latest-updates)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 
@@ -519,6 +560,54 @@ python -m moonshine ask --mode research \
 Research autopilot stops when it reaches its iteration limit, completes a final
 verified result, detects provider failure, or hits configured safety limits.
 
+### Final research reports
+
+When a research run reaches a project-level result and `verify_overall` passes
+with `scope="final"`, Moonshine can generate a polished Markdown research report
+for direct review.
+
+Reports are written under:
+
+```text
+projects/<project-slug>/reports/
+```
+
+Each report is saved as a new file; existing reports are not overwritten. When a
+previous report exists, the next report uses the latest report as the starting
+summary of prior progress, then focuses on the new verified progress from the
+current reporting window.
+
+Report generation is project-level. If multiple sessions have contributed to the
+same project and some progress has not yet been included in a report, the next
+successful final report includes the pending project research log plus the
+relevant pending session messages and tool events. After the report is written,
+the pending report offsets for that project are cleared so the same window is not
+reported again.
+
+### Research progress types
+
+Research mode preserves project progress as small research-report records. Each
+record has exactly one type:
+
+- `problem`: the research problem itself, including revisions, hypothesis
+  changes, object definitions, or target changes.
+- `verified_conclusion`: reusable verified mathematics such as lemmas,
+  propositions, theorems, constructions, or classifications. This type is about
+  the conclusion itself.
+- `verification`: a review/checking record. This type is about what was checked,
+  whether it passed, what defects were found, and what should be repaired.
+- `project_result`: the project-level final result only. Use this for the final
+  answer, theorem, construction, classification, or negative result after final
+  verification has passed. Ordinary verified lemmas or intermediate theorems go
+  under `verified_conclusion`.
+- `counterexample`: a counterexample or negative construction refuting a claim.
+  Even verified counterexamples stay in this type when the record centers on the
+  refutation.
+- `failed_path`: a failed route, method, proof strategy, or technical approach.
+  It can coexist with a counterexample, but focuses on why the route failed.
+- `research_note`: other stage-level research progress, such as unverified
+  derivations, calculations, observations, reductions, plans, or next steps.
+
 ## Sessions
 
 Resume an existing session:
@@ -580,11 +669,14 @@ Research-log record types:
 problem
 verified_conclusion
 verification
-final_result
+project_result
 counterexample
 failed_path
 research_note
 ```
+
+See [Research progress types](#research-progress-types) for the meaning and
+boundary of each type.
 
 Search project memory:
 
@@ -976,35 +1068,6 @@ MOONSHINE_HOME/
       references/
       memory/
 ```
-
-## Latest Updates
-
-### 2026-06
-
-- Added OpenAI Responses provider support.
-- Added reasoning effort and reasoning summary configuration.
-- Added dedicated archival provider configuration.
-- Added archival fallback to the main provider.
-- Added structured-output support for Responses-based verification and archival.
-- Added project-local Python script execution.
-- Added Python package installation for project scripts.
-- Improved compatibility for assistant `reasoning_content` in session history.
-- Improved session continuation with reasoning and visible assistant content.
-
-### 2026-05
-
-- Added typed project research logs.
-- Added `research_log.jsonl`, readable `research_log.md`, by-type Markdown files,
-  and `research_log_index.sqlite`.
-- Added unified session-record retrieval.
-- Added indexed tool-event retrieval.
-- Added recovery references for large archived tool payloads.
-- Added query-time backfill for older session files.
-- Added `query_session_records` for exact raw session recovery.
-- Added exposure controls for skills and tools.
-- Added Usage Hint loading from skill and tool Markdown files.
-- Added Tavily MCP setup commands.
-- Improved research-mode provider failure handling.
 
 ## Testing
 
