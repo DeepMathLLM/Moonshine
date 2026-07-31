@@ -1030,6 +1030,37 @@ class AIAgent(object):
                 return False
         return False
 
+    def _sanitize_provider_messages(self, messages):
+        """Demote assistant tool_calls that lack matching tool messages to plain text.
+
+        Strict OpenAI-compatible endpoints (OpenAI/Azure/DeepSeek/vLLM) reject orphaned
+        tool_calls with HTTP 400, so requests must never contain them.
+        """
+        result = []
+        i, n = 0, len(messages or [])
+        while i < n:
+            msg = dict(messages[i])
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                ids = [str(tc.get("id") or "") for tc in msg["tool_calls"]]
+                j = i + 1
+                seen = set()
+                while j < n and messages[j].get("role") == "tool":
+                    seen.add(str(messages[j].get("tool_call_id") or ""))
+                    j += 1
+                if any(t not in seen for t in ids):
+                    folded = "\n\n".join(
+                        "Tool %s result:\n%s"
+                        % (str(messages[k].get("tool_call_id") or "?"), str(messages[k].get("content") or ""))
+                        for k in range(i + 1, j)
+                    )
+                    text = "\n\n".join(p for p in (str(msg.get("content") or "").strip(), folded) if p)
+                    result.append({"role": "assistant", "content": text or "[tool calls not executed]"})
+                    i = j
+                    continue
+            result.append(msg)
+            i += 1
+        return result
+
     def _stream_provider_round(self, state: ConversationState):
         """Run one provider round and stream text deltas as agent events."""
         streamed_chunks: List[str] = []
@@ -1078,6 +1109,7 @@ class AIAgent(object):
             )
             if status_event is not None:
                 yield status_event
+        state.provider_messages = self._sanitize_provider_messages(state.provider_messages)
         request_messages = self._snapshot_messages(state.provider_messages)
         for provider_event in self.provider.stream_generate(
             system_prompt=state.system_prompt,
@@ -1163,6 +1195,7 @@ class AIAgent(object):
 
         streamed_chunks: List[str] = []
         response = None
+        finalization_messages = self._sanitize_provider_messages(finalization_messages)
         request_messages = self._snapshot_messages(finalization_messages)
         for provider_event in self.provider.stream_generate(
             system_prompt=finalization_prompt,
@@ -1469,6 +1502,20 @@ class AIAgent(object):
                     state.fallback_response_reasoning_content = response.reasoning_content if str(response.reasoning_content or "").strip() else ""
 
                 prepared_calls, invalid_batch = self._prepare_tool_calls(state, response.tool_calls)
+                if state.tool_rounds >= state.budget.max_tool_rounds:
+                    # Do not append an assistant tool-call message that we cannot follow
+                    # with matching tool messages: strict OpenAI-compatible endpoints
+                    # (e.g. DeepSeek) reject the next request with HTTP 400
+                    # ("insufficient tool messages following tool_calls").
+                    state.final_reason = "tool_round_limit_reached"
+                    status_event = self._emit_status(
+                        state,
+                        "Tool round limit reached; finalizing without more tool execution.",
+                        max_tool_rounds=state.budget.max_tool_rounds,
+                    )
+                    if status_event is not None:
+                        yield status_event
+                    break
                 repaired_calls = [item for item in prepared_calls if item.repaired_from]
                 if repaired_calls:
                     repaired_text = ", ".join(
@@ -1542,17 +1589,6 @@ class AIAgent(object):
                     if status_event is not None:
                         yield status_event
                     continue
-
-                if state.tool_rounds >= state.budget.max_tool_rounds:
-                    state.final_reason = "tool_round_limit_reached"
-                    status_event = self._emit_status(
-                        state,
-                        "Tool round limit reached; finalizing without more tool execution.",
-                        max_tool_rounds=state.budget.max_tool_rounds,
-                    )
-                    if status_event is not None:
-                        yield status_event
-                    break
 
                 state.tool_rounds += 1
                 state.post_tool_nudge_used = False
