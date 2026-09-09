@@ -5,6 +5,9 @@ from __future__ import annotations
 import traceback
 from typing import Dict, List, Optional, Sequence
 
+from moonshine.agent_runtime.execution_journal import ToolExecutionJournal
+
+
 def collect_tool_schemas(
     registry,
     mode: Optional[str] = None,
@@ -17,26 +20,43 @@ def collect_tool_schemas(
 
 
 def handle_function_calls(registry, calls: List[object], runtime: Dict[str, object]) -> List[Dict[str, object]]:
-    """Dispatch provider tool calls through the registry."""
+    """Dispatch provider tool calls through the registry with crash-safe journaling."""
+    journal = ToolExecutionJournal(runtime)
+    blockers = journal.blockers()
+    if blockers:
+        return journal.blocked_results(calls, blockers)
+
     results = []
     for call in calls:
+        execution_id = journal.begin(call)
         try:
-            result = registry.dispatch(call.name, call.arguments, runtime)
-            error = None
-        except Exception as exc:
-            result = {
-                "error": str(exc),
-                "traceback": traceback.format_exc(limit=3),
-            }
-            error = str(exc)
-        results.append(
-            {
-                "name": call.name,
-                "call_id": getattr(call, "call_id", ""),
-                "arguments": call.arguments,
-                "output": result,
-                "error": error,
-            }
-        )
-        runtime.setdefault("_tool_results_in_round", []).append(results[-1])
+            try:
+                result = registry.dispatch(call.name, call.arguments, runtime)
+                error = None
+            except Exception as exc:
+                result = {
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(limit=3),
+                }
+                error = str(exc)
+            journal.finish(call, execution_id, output=result, error=error)
+        except BaseException as exc:
+            try:
+                journal.mark_ambiguous(call, execution_id, exc)
+            except Exception:
+                # Never replace the process-level interruption with a best-effort
+                # journaling failure. A durable start record, when it was written,
+                # is itself enough for the next process to fail closed.
+                pass
+            raise
+
+        result_record = {
+            "name": call.name,
+            "call_id": getattr(call, "call_id", ""),
+            "arguments": call.arguments,
+            "output": result,
+            "error": error,
+        }
+        results.append(result_record)
+        runtime.setdefault("_tool_results_in_round", []).append(result_record)
     return results
