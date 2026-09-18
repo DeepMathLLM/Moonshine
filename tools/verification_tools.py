@@ -864,7 +864,9 @@ def pessimistic_verify(
     """Run independent LLM reviews and fail if any reviewer objects."""
     resolved_project = str(project_slug or runtime.get("project_slug") or "general")
     provider = runtime.get("provider")
-    _require_verification_provider(provider)
+    # No hard provider gate here: _run_one_review degrades to a conservative
+    # inconclusive failure review when no structured provider is available, so
+    # pessimistic_verify fails closed instead of raising a fatal tool error.
     count = _bounded_review_count(review_count)
     reviews = []
     for reviewer_id, review_focus in REVIEWER_PROFILES[:count]:

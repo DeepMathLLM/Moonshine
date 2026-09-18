@@ -565,7 +565,7 @@ class MCPServerRegistry(object):
         enabled = [item for item in self.list_servers() if item.enabled]
         if not enabled:
             return ""
-        lines = ["Enabled MCP server descriptors:"]
+        lines = ["Available MCP servers (short descriptions and usage guidance):"]
         for item in enabled[:limit]:
             lines.append("- %s: %s" % (item.slug, item.description or item.title))
         if len(enabled) > limit:

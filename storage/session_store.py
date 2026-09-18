@@ -254,6 +254,19 @@ class SessionStore(object):
             parts.append("Error: %s" % payload.get("error"))
         return "\n".join(parts)
 
+    def append_tool_result_conversation_event(self, session_id: str, payload: Dict[str, object]) -> int:
+        """Append one executed tool call as a structured tool_result conversation event."""
+        event_payload = dict(payload)
+        created_at = str(event_payload.pop("created_at", "") or "") or None
+        return self.append_conversation_event(
+            session_id,
+            event_kind="tool_result",
+            role="tool",
+            content=self._render_tool_event_content(event_payload),
+            payload=event_payload,
+            created_at=created_at,
+        )
+
     def _render_tool_event_search_text(self, payload: Dict[str, object]) -> str:
         """Render the original tool-event payload fields used for indexed retrieval."""
         return json.dumps(

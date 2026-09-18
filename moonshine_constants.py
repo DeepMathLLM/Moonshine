@@ -34,6 +34,7 @@ DEFAULT_AGENT_RULES_MD = """# Moonshine Working Rules
 
 ## Execution
 - Let ordinary turns carry the reasoning; in research mode, use project research-memory files as evidence when prior progress matters.
+- Let actual tool calls carry memory, knowledge, file, and research-state updates.
 - Treat skills as working methods and tools as executable actions.
 - When a brief summary is not enough, load the full agent, skill, tool, or MCP definition.
 

@@ -226,9 +226,13 @@ class ToolRegistry(object):
         if name not in self._tools:
             raise KeyError("unknown tool: %s" % name)
         definition = self._tools[name]
-        mode = str((runtime or {}).get("mode") or "")
         exposure = _runtime_exposure(runtime)
-        if not self._visible_in_mode(definition, mode=mode) or not self._included_by_name(
+        # MODE_HIDDEN_TOOLS and the `internal` flag only govern model-facing
+        # schemas/listings; dispatch stays callable so internal flows and research
+        # tools remain usable in every mode. Research-mode restrictions that must
+        # be enforced live inside the tool handlers themselves (e.g.
+        # store_conclusion/add_knowledge raise there).
+        if not self._included_by_name(
             definition.name,
             include=list(exposure.get("tools_include") or []),
             exclude=list(exposure.get("tools_exclude") or []),

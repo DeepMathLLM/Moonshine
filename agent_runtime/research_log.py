@@ -357,6 +357,7 @@ class ResearchLogStore(object):
                 append_jsonl(self.log_path(project_slug), record)
             self.rebuild_markdown_views(project_slug)
             self._sync_blueprint_markdown(project_slug)
+            self._sync_blueprint_verified_markdown(project_slug)
             self.rebuild_index(project_slug)
         return created_records
 
@@ -396,6 +397,17 @@ class ResearchLogStore(object):
         """Keep workspace/blueprint.md as the readable research-log mirror."""
         text = read_text(self.markdown_path(project_slug), default="")
         atomic_write(self.paths.project_blueprint_file(project_slug), text.rstrip() + ("\n" if text.strip() else ""))
+
+    def _sync_blueprint_verified_markdown(self, project_slug: str) -> None:
+        """Keep workspace/blueprint_verified.md as the readable verification-record mirror.
+
+        The seeded placeholder is preserved until the project actually has
+        verification records to publish.
+        """
+        text = read_text(self.paths.project_research_log_type_file(project_slug, "verification"), default="")
+        if not text.strip():
+            return
+        atomic_write(self.paths.project_blueprint_verified_file(project_slug), text.rstrip() + "\n")
 
     def _mirror_verified_conclusion(self, project_slug: str, record: Dict[str, object]) -> None:
         if self.knowledge_store is None:

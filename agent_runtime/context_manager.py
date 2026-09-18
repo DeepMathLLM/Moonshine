@@ -143,12 +143,12 @@ class ContextManager(object):
             kept.append("... [truncated]")
         return "\n".join(line for line in kept if line).strip()
 
-    def _summarize_bounded_text_with_provider(self, *, purpose: str, text: str, token_budget: int) -> str:
+    def _summarize_bounded_text_with_provider(self, *, purpose: str, text: str, token_budget: int, force_provider: bool = False) -> str:
         """Ask the configured provider for one already-bounded source summary."""
         source = str(text or "").strip()
         if not source:
             return ""
-        if self.estimate_tokens(source) <= token_budget:
+        if not force_provider and self.estimate_tokens(source) <= token_budget:
             return source
 
         if not isinstance(self.provider, OfflineProvider):
@@ -201,7 +201,7 @@ class ContextManager(object):
         rendered = "\n".join("- %s" % item for item in bullets if item)
         return self._trim_text_to_budget(rendered or shorten(source, token_budget * 4), token_budget)
 
-    def _summarize_with_provider(self, *, purpose: str, text: str, token_budget: int) -> str:
+    def _summarize_with_provider(self, *, purpose: str, text: str, token_budget: int, force_provider: bool = False) -> str:
         """Compress text through bounded provider calls and concatenate chunk summaries."""
         chunks = split_text_by_token_budget(
             text,
@@ -215,6 +215,7 @@ class ContextManager(object):
                 purpose=purpose,
                 text=chunks[0],
                 token_budget=token_budget,
+                force_provider=force_provider,
             )
         summaries = []
         for index, chunk in enumerate(chunks, start=1):
@@ -222,6 +223,7 @@ class ContextManager(object):
                 purpose="%s chunk %s/%s" % (purpose, index, len(chunks)),
                 text=chunk,
                 token_budget=token_budget,
+                force_provider=force_provider,
             )
             if summary:
                 summaries.append(summary)
@@ -432,10 +434,14 @@ class ContextManager(object):
         chunks = self._chunk_history_by_count(older_messages, chunk_count=chunk_count)
         summaries = []
         for chunk_index, chunk in enumerate(chunks, start=1):
+            # Count-based history chunks are always provider-summarized, even
+            # when a chunk already fits the token budget, so every chunk keeps
+            # a uniform compact research-progress-report shape.
             summary = self._summarize_with_provider(
                 purpose="conversation history chunk %s/%s" % (chunk_index, len(chunks)),
                 text=self._format_history_for_summary(chunk),
                 token_budget=per_chunk_budget,
+                force_provider=True,
             )
             summaries.append(summary)
         return summaries
@@ -1701,8 +1707,9 @@ class ContextManager(object):
                 limit=result_limit * max(1, len(research_log_types) or 1),
             )
 
+        research_only = bool(research_log_types) or saw_research_type_filter
         raw_hits: Dict[str, object] = {}
-        if not research_log_types and not saw_research_type_filter:
+        if not research_only:
             raw_hits = self.memory_manager.query_memory_sources(
                 query,
                 project_slug,
@@ -1714,12 +1721,28 @@ class ContextManager(object):
         dynamic_hits = list(raw_hits.get("dynamic_hits") or [])
         session_record_hits = list(raw_hits.get("session_record_hits") or [])
         knowledge_hits = list(raw_hits.get("knowledge_hits") or [])
+        session_hits = [
+            dict(item)
+            for item in session_record_hits
+            if str(item.get("record_type") or "") == "message"
+        ]
+        event_hits: List[Dict[str, object]] = []
+        if not research_only and self.session_store is not None:
+            try:
+                event_hits = self.session_store.search_conversation_events(
+                    query,
+                    limit=result_limit,
+                    project_slug=project_slug,
+                )
+            except Exception:
+                event_hits = []
 
         ranked_lists = [self._normalize_research_hits(research_log_hits)]
-        if not research_log_types and not saw_research_type_filter:
+        if not research_only:
             ranked_lists.extend(
                 [
                     self._normalize_session_record_hits(session_record_hits),
+                    self._normalize_event_hits(event_hits),
                     self._normalize_dynamic_hits(dynamic_hits),
                     self._normalize_knowledge_hits(knowledge_hits),
                 ]
@@ -1760,6 +1783,14 @@ class ContextManager(object):
                     "record_type": str(metadata.get("record_type") or ""),
                     "archive_path": str(metadata.get("archive_path") or ""),
                 }
+            elif source == "session-event":
+                result["local_context"] = self._build_session_context_window(item, query)
+                result["source_refs"] = {
+                    "session_id": str(metadata.get("session_id") or ""),
+                    "record_id": "event:%s" % str(metadata.get("event_id") or ""),
+                    "record_type": str(metadata.get("event_kind") or "event"),
+                    "archive_path": "",
+                }
             elif source == "dynamic":
                 result["local_context"] = self._build_dynamic_context_window(item, query)
                 result["source_refs"] = {
@@ -1779,6 +1810,49 @@ class ContextManager(object):
                 result["source_refs"] = dict(metadata)
             results.append(result)
 
+        compressed_windows: List[Dict[str, object]] = []
+        for item in merged[: max(1, result_limit * 2)]:
+            source = str(item.get("source") or "")
+            metadata = dict(item.get("metadata") or {})
+            if source == "research-log":
+                window_text = self._build_research_context_window(item, query)
+            elif source in {"session", "session-record", "session-event"}:
+                window_text = self._build_session_context_window(item, query)
+            elif source == "dynamic":
+                window_text = self._build_dynamic_context_window(item, query)
+            elif source == "knowledge":
+                window_text = self._build_knowledge_context_window(item, query)
+            else:
+                window_text = str(item.get("text") or "")
+            compressed_windows.append(
+                {
+                    "key": str(item.get("key") or ""),
+                    "source": "research-artifact" if source == "research-log" else source,
+                    "title": str(item.get("title") or ""),
+                    "summary": str(
+                        metadata.get("summary") or metadata.get("exact_excerpt") or item.get("text") or ""
+                    ),
+                    "window_excerpt": window_text,
+                }
+            )
+
+        summary_lines: List[str] = []
+        for item in merged[: max(1, result_limit)]:
+            metadata = dict(item.get("metadata") or {})
+            label = str(
+                metadata.get("record_type")
+                or metadata.get("artifact_type")
+                or metadata.get("event_kind")
+                or item.get("source")
+                or "memory"
+            )
+            excerpt = str(
+                metadata.get("exact_excerpt") or metadata.get("summary") or item.get("text") or ""
+            ).strip()
+            line = "[%s] %s" % (label, str(item.get("title") or ""))
+            summary_lines.append("%s\n%s" % (line, excerpt) if excerpt else line)
+        summary = "\n\n".join(line for line in summary_lines if line.strip())
+
         locations: Dict[str, object] = {}
         if project_slug:
             locations["project_research_log"] = self.paths.project_research_log_file(project_slug).relative_to(self.paths.home).as_posix()
@@ -1787,6 +1861,31 @@ class ContextManager(object):
             locations["active_session"] = self.paths.session_dir(session_id).relative_to(self.paths.home).as_posix()
         locations["session_index"] = self.paths.sessions_db.relative_to(self.paths.home).as_posix()
 
+        research_hits_payload: List[Dict[str, object]] = []
+        for item in research_log_hits:
+            hit_metadata = dict(item.get("metadata") or {})
+            record_type = str(item.get("type") or hit_metadata.get("record_type") or "research_note")
+            exact_excerpt = str(hit_metadata.get("exact_excerpt") or item.get("content_inline") or "")
+            raw_text = str(hit_metadata.get("raw_text") or item.get("content") or "")
+            retrieval_mode = str(hit_metadata.get("retrieval_mode") or "").strip() or "research_index"
+            title = str(item.get("title") or "")
+            research_hits_payload.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "source": "research-artifact",
+                    "type": record_type,
+                    "title": title,
+                    "content": raw_text,
+                    "exact_excerpt": exact_excerpt,
+                    "retrieval_mode": retrieval_mode,
+                    "score": float(item.get("score") or 0.0),
+                    "project_slug": str(item.get("project_slug") or ""),
+                    "session_id": str(item.get("session_id") or ""),
+                    "source_refs": list(item.get("source_refs") or []),
+                    "created_at": str(item.get("created_at") or ""),
+                }
+            )
+
         return {
             "query": query,
             "scope": {
@@ -1794,6 +1893,23 @@ class ContextManager(object):
                 "all_projects": bool(all_projects),
                 "types": research_log_types,
             },
+            "project_scope": "all-projects" if all_projects else str(project_slug or ""),
+            "all_projects": bool(all_projects),
+            "types": research_log_types,
+            "channels": [str(item) for item in list(channels or [])],
+            "channel_mode": normalized_channel_mode,
+            "limit_per_channel": result_limit,
+            "prefer_raw": bool(prefer_raw),
+            "summary": summary,
             "results": results,
+            "compressed_windows": compressed_windows,
+            "sources": [dict(item) for item in merged],
+            "research_log_hits": research_log_hits,
+            "research_hits": research_hits_payload,
+            "dynamic_hits": self._serialize_dynamic_hit_rows(dynamic_hits),
+            "session_hits": session_hits,
+            "event_hits": event_hits,
+            "knowledge_hits": knowledge_hits,
+            "graph_hits": [],
             "raw_record_locations": locations,
         }

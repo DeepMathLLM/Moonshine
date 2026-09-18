@@ -45,6 +45,15 @@ WORKFLOW_VERSION = 3
 RESEARCH_COMPRESSION_INPUT_TOKEN_BUDGET = 500000
 RESEARCH_ARCHIVE_INPUT_TOKEN_BUDGET = 100000
 
+# Tools whose results are folded into the verification digest log and workflow state.
+VERIFICATION_OBSERVATION_TOOLS = {
+    "pessimistic_verify",
+    "verify_overall",
+    "verify_correctness_assumption",
+    "verify_correctness_computation",
+    "verify_correctness_logic",
+}
+
 RESEARCH_FINAL_REPORT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -356,6 +365,7 @@ AUTO_PROBLEM_DRAFT_MARKER = "<!-- moonshine:auto-problem-draft -->"
 
 SECTION_ALIASES = {
     "problem_draft": ["problem draft", "active problem", "current problem"],
+    "blueprint_draft": ["blueprint draft", "blueprint draft update", "proof blueprint draft"],
     "candidate_problem": ["candidate problem", "candidate problems"],
     "problem_review": ["problem review", "quality review"],
     "stage_transition": ["stage transition", "stage decision", "design decision"],
@@ -368,6 +378,30 @@ SECTION_ALIASES = {
     "branch_update": ["branch update", "branch state"],
     "solve_attempt": ["solve attempt", "solve attempts", "solve step", "solve steps"],
     "checkpoint": ["checkpoint", "next steps", "consolidation"],
+}
+
+
+RESEARCH_ARTIFACT_LOG_TYPES = {
+    "candidate_problem": "problem",
+    "active_problem": "problem",
+    "problem": "problem",
+    "problem_revision": "problem",
+    "final_problem": "problem",
+    "verified_conclusion": "verified_conclusion",
+    "intermediate_conclusion": "verified_conclusion",
+    "verification": "verification",
+    "verification_report": "verification",
+    "problem_review": "verification",
+    "project_result": "project_result",
+    "final_result": "project_result",
+    "counterexample": "counterexample",
+    "failed_path": "failed_path",
+    "stage_transition": "research_note",
+    "solve_attempt": "research_note",
+    "subgoal_plan": "research_note",
+    "example": "research_note",
+    "toy_example": "research_note",
+    "research_note": "research_note",
 }
 
 
@@ -1463,15 +1497,73 @@ class ResearchWorkflowManager(object):
         """Archive leftover structural fragments from older project layouts."""
         if not project_slug or not self.paths.project_dir(project_slug).exists():
             return {"project_slug": project_slug, "skipped": True}
+        imported = self._import_legacy_research_state(project_slug)
         archived_recursive = self._cleanup_recursive_projects(project_slug)
         archived_versions = self._archive_version_fragments(project_slug)
         summary = {
             "project_slug": project_slug,
+            "imported_records": imported["records"],
+            "imported_channels": imported["channels"],
+            "imported_verifications": imported["verifications"],
             "archived_recursive_projects": archived_recursive,
             "archived_version_fragments": archived_versions,
             "created_at": utc_now(),
         }
         return summary
+
+    def _import_legacy_research_state(self, project_slug: str) -> Dict[str, int]:
+        """Import pre-research-log legacy records into the canonical stores.
+
+        Legacy `research_state/records.jsonl` entries route by artifact type:
+        verification reports become compact verification digest rows (deduped
+        by verification key) and every other artifact becomes a canonical
+        research_log.jsonl record (deduped by record id). Legacy channel files
+        (`memory/channels/*.jsonl`) are superseded by the research log and are
+        left in place untouched, so `channels` stays at zero.
+        """
+        counts = {"records": 0, "channels": 0, "verifications": 0}
+        records_path = self.paths.project_research_records_file(project_slug)
+        legacy_records = [item for item in read_jsonl(records_path) if isinstance(item, dict)]
+        if not legacy_records:
+            return counts
+        log_records: List[Dict[str, object]] = []
+        for item in legacy_records:
+            artifact_type = str(item.get("artifact_type") or item.get("type") or "").strip()
+            metadata = dict(item.get("metadata") or {})
+            if artifact_type == "verification_report":
+                claim_text = str(metadata.get("claim") or "").strip()
+                if not claim_text:
+                    continue
+                row = self._append_verification_digest(
+                    project_slug,
+                    claim=claim_text,
+                    summary=str(item.get("summary") or ""),
+                    review_status=str(item.get("review_status") or ""),
+                    status=str(item.get("status") or ""),
+                    source_id=str(item.get("id") or ""),
+                    metadata=metadata,
+                    created_at=str(item.get("created_at") or ""),
+                )
+                if row is not None:
+                    counts["verifications"] += 1
+                continue
+            content = str(item.get("content") or item.get("summary") or "").strip()
+            if not content:
+                continue
+            log_records.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "type": normalize_research_log_type(artifact_type or "research_note"),
+                    "title": str(item.get("title") or ""),
+                    "content": content,
+                    "session_id": str(item.get("session_id") or ""),
+                    "created_at": str(item.get("created_at") or ""),
+                }
+            )
+        if log_records:
+            created = self.research_log.append_records(project_slug, log_records)
+            counts["records"] = len(created)
+        return counts
 
     def _remember_recent_artifact(self, state: ResearchWorkflowState, record: Dict[str, object]) -> None:
         """Keep a lightweight rolling window of recent research artifacts in the snapshot."""
@@ -1799,6 +1891,21 @@ class ResearchWorkflowManager(object):
         """Compatibility no-op: scratchpad.md is no longer maintained by research mode."""
         return str(self._scratchpad_path(project_slug).relative_to(self.paths.home).as_posix())
 
+    def _ensure_workspace_scaffold(self, project_slug: str) -> None:
+        """Scaffold placeholder workspace files that compatibility readers expect to exist.
+
+        Research mode no longer maintains scratchpad.md contents, but the file
+        itself is still created once so workspace listings and readers find it.
+        """
+        scratchpad = self._scratchpad_path(project_slug)
+        if not scratchpad.exists():
+            atomic_write(
+                scratchpad,
+                "# Research Scratchpad\n\n"
+                "Scratchpad notes are no longer maintained by research mode; "
+                "project research memory lives in `memory/research_log.jsonl`.\n",
+            )
+
     def _publish_verified_blueprint(self, project_slug: str) -> str:
         """Copy the readable research log to the verified blueprint path for compatibility."""
         blueprint_text = read_text(self._blueprint_draft_path(project_slug)).strip()
@@ -1946,6 +2053,11 @@ class ResearchWorkflowManager(object):
             )
         lines.append(
             "- Use `query_memory` to retrieve project memory from `memory/research_log_index.sqlite`; pass `types=[\"failed_path\"]`, `types=[\"verified_conclusion\"]`, or another research-log type only when the need is type-specific."
+        )
+        lines.append(
+            "- Legacy channel names map onto research-log types: `failed_paths` -> `failed_path`, "
+            "`solve_steps`/`subgoals`/`branch_states`/`special_case_checks`/`novelty_notes` -> `research_note`, "
+            "`final_result` -> `project_result`, `conclusion` -> `verified_conclusion`."
         )
         lines.append(
             "- `research_log.jsonl` is the project-memory source of truth; `by_type/*.md` files are readable views and the SQLite index is rebuildable."
@@ -2227,13 +2339,20 @@ class ResearchWorkflowManager(object):
         return 0
 
     def _refresh_live_attempt_counters(self, state: ResearchWorkflowState) -> None:
-        """Refresh attempt counters from persisted turn checkpoints plus the current activity."""
-        state.correction_attempts = self._count_turn_checkpoints(state.project_slug, "correction")
-        state.strengthening_attempts = self._count_turn_checkpoints(state.project_slug, "strengthening")
+        """Refresh attempt counters from persisted turn checkpoints plus the current activity.
+
+        Counters accumulate across refreshes: a correction/strengthening attempt
+        recorded by an earlier refresh stays counted when the workflow later moves
+        into a different activity.
+        """
+        correction = self._count_turn_checkpoints(state.project_slug, "correction")
+        strengthening = self._count_turn_checkpoints(state.project_slug, "strengthening")
         if state.node == "correction":
-            state.correction_attempts += 1
+            correction += 1
         if state.node == "strengthening":
-            state.strengthening_attempts += 1
+            strengthening += 1
+        state.correction_attempts = max(int(state.correction_attempts or 0), correction)
+        state.strengthening_attempts = max(int(state.strengthening_attempts or 0), strengthening)
 
     def _refresh_live_state_assessment(self, state: ResearchWorkflowState, *, session_id: str) -> None:
         """Recompute the snapshot assessment from current persisted evidence."""
@@ -2494,11 +2613,12 @@ class ResearchWorkflowManager(object):
         state: ResearchWorkflowState,
         assistant_message: str,
     ) -> Dict[str, object]:
-        """Capture direct stage proposals from assistant output.
+        """Capture direct stage proposals and blueprint drafts from assistant output.
 
         Project research memory is updated from turn records separately. This
-        capture step deliberately avoids writing project drafts from assistant
-        sections.
+        capture step writes `## Blueprint Draft` sections into the canonical
+        blueprint workspace file so a later verification gate can be invalidated
+        when the proof text changes without a fresh verifier call.
         """
         capture = {
             "updated_files": [],
@@ -2509,6 +2629,21 @@ class ResearchWorkflowManager(object):
         message = str(assistant_message or "")
         if not message.strip():
             return capture
+
+        # Blueprint draft sections only count once the workflow is actually solving;
+        # during problem design they are premature and must not touch workspace files.
+        blueprint_blocks = self._section_bodies(message, "blueprint_draft") if state.stage == "problem_solving" else []
+        if blueprint_blocks:
+            blueprint_body = str(blueprint_blocks[-1] or "").strip()
+            if blueprint_body:
+                blueprint_path = self._append_workspace_draft(
+                    self._blueprint_draft_path(project_slug),
+                    blueprint_body,
+                    kind="blueprint",
+                    title="Blueprint Draft Update",
+                )
+                capture["updated_files"] = list(capture.get("updated_files") or []) + [blueprint_path]
+                capture["blueprint_updated"] = True
 
         transition_blocks = self._section_bodies(message, "stage_transition")
         if transition_blocks:
@@ -2849,6 +2984,18 @@ class ResearchWorkflowManager(object):
         self._remember_recent_artifact(state, record)
         return applied
 
+    def _research_log_type_for_artifact(self, artifact_type: str) -> str:
+        """Map one research artifact type onto the canonical research-log record type."""
+        mapping = {
+            "candidate_problem": "problem",
+            "active_problem": "problem",
+            "problem_review": "verification",
+            "verification_report": "verification",
+            "failed_path": "failed_path",
+            "counterexample": "counterexample",
+        }
+        return mapping.get(str(artifact_type or "").strip(), "research_note")
+
     def record_artifact(
         self,
         *,
@@ -2868,21 +3015,87 @@ class ResearchWorkflowManager(object):
         set_as_active: bool = False,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """Deprecated explicit artifact entry point.
+        """Persist one typed research artifact into the project research log.
 
-        Project research memory is managed by the project research-memory pipeline.
+        Explicit artifacts become research_log.jsonl records so `query_memory`
+        can retrieve them through the canonical research-log index. Artifact
+        types map onto research-log types; unknown types fall back to
+        `research_note` via the research-log normalization rules.
         """
+        normalized_artifact = str(artifact_type or "").strip() or "research_note"
+        record_type = RESEARCH_ARTIFACT_LOG_TYPES.get(normalized_artifact) or normalize_research_log_type(normalized_artifact)
+        clean_title = str(title or "").strip() or shorten(str(summary or content or ""), 80) or "Research artifact"
+        body = "\n\n".join(part for part in (str(summary or "").strip(), str(content or "").strip()) if part)
+        created_at = utc_now()
+        state = self.load_state(project_slug)
+        metadata = dict(metadata or {})
+
+        records: List[Dict[str, object]] = []
+        record_id = ""
+        if body:
+            records = self.research_log.append_records(
+                project_slug,
+                [
+                    {
+                        "type": record_type,
+                        "title": clean_title,
+                        "content": body,
+                        "session_id": session_id,
+                        "created_at": created_at,
+                    }
+                ],
+            )
+            if records:
+                record_id = str(records[0].get("id") or "")
+
+        if normalized_artifact in {"candidate_problem", "active_problem", "problem", "problem_revision"} and (
+            set_as_active or not str(state.active_problem or "").strip()
+        ):
+            self._set_active_problem(
+                state,
+                statement=str(content or "").strip() or str(summary or "").strip() or clean_title,
+                created_at=created_at,
+            )
+        if normalized_artifact == "problem_review":
+            self._update_problem_review(
+                state,
+                title=clean_title,
+                summary=str(summary or "").strip(),
+                review_status=str(review_status or metadata.get("review_status") or "pending"),
+                metadata=metadata,
+                created_at=created_at,
+            )
+        if normalized_artifact == "verification_report":
+            claim_text = str(metadata.get("claim") or "").strip()
+            if claim_text:
+                self._append_verification_digest(
+                    project_slug,
+                    claim=claim_text,
+                    summary=str(summary or "").strip(),
+                    review_status=str(review_status or metadata.get("review_status") or ""),
+                    status=str(status or metadata.get("status") or ""),
+                    source_id=record_id,
+                    metadata=metadata,
+                    created_at=created_at,
+                )
+        if normalized_artifact == "stage_transition":
+            self._apply_stage_transition(state, metadata=metadata, created_at=created_at, summary=str(summary or "").strip())
+        self.save_state(state)
+
         return {
-            "id": "",
-            "artifact_type": str(artifact_type or "").strip(),
-            "title": str(title or "").strip(),
-            "stage": str(stage or ""),
-            "focus_activity": str(focus_activity or ""),
-            "status": "deprecated",
-            "content_path": "",
+            "id": record_id,
+            "artifact_type": normalized_artifact,
+            "record_type": record_type,
+            "title": clean_title,
+            "stage": str(stage or state.stage or ""),
+            "focus_activity": str(focus_activity or state.node or ""),
+            "status": str(status or "recorded"),
+            "review_status": str(review_status or ""),
+            "content_path": "projects/%s/memory/research_log.jsonl" % project_slug,
             "summary": str(summary or ""),
-            "archived": 0,
-            "message": "Explicit artifact recording is disabled; project research memory uses research_log.jsonl.",
+            "archived": 1 if records else 0,
+            "applied": dict(state.transition_status or {}),
+            "message": "Recorded in projects/%s/memory/research_log.jsonl." % project_slug,
         }
 
     def commit_turn(
@@ -3025,12 +3238,141 @@ class ResearchWorkflowManager(object):
         output: Dict[str, object],
         error: str = "",
     ) -> None:
-        """No-op observer.
+        """Fold one executed research-mode tool result into project research memory.
 
-        Tool events are saved in the session log by the caller. Project
-        research memory is updated from those saved turn records.
+        Retrieval tools (query_memory, search_knowledge, read_runtime_file) leave a
+        deduplicated navigation note in research_log.jsonl so later turns can see
+        which knowledge and reference reads already happened. Verification tools
+        append a compact verification digest (keyed by claim + proof/blueprint
+        context) and refresh the lightweight workflow state (verdict, pending
+        verification targets, claim registry, final gate).
         """
-        return
+        if str(error or "").strip():
+            return
+        tool = str(tool_name or "").strip()
+        if not tool or not isinstance(output, dict) or not output:
+            return
+        arguments = dict(arguments or {})
+        artifact: Optional[Dict[str, object]] = None
+        if tool == "query_memory":
+            artifact = self._tool_query_memory_artifact(arguments, output)
+        elif tool == "search_knowledge":
+            artifact = self._tool_search_knowledge_artifact(arguments, output)
+        elif tool == "read_runtime_file":
+            artifact = self._tool_read_runtime_artifact(
+                project_slug=project_slug,
+                arguments=arguments,
+                output=output,
+            )
+        if artifact:
+            self._append_tool_navigation_record(
+                project_slug,
+                session_id=session_id,
+                artifact=artifact,
+            )
+        if tool in VERIFICATION_OBSERVATION_TOOLS:
+            self._observe_verification_tool_result(
+                project_slug,
+                tool_name=tool,
+                arguments=arguments,
+                output=output,
+            )
+
+    def _append_tool_navigation_record(
+        self,
+        project_slug: str,
+        *,
+        session_id: str,
+        artifact: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        """Append one deduplicated navigation note built from a retrieval tool result."""
+        signature = str(artifact.get("signature") or "").strip()
+        if signature and self._recent_tool_signature_exists(project_slug, signature):
+            return None
+        record = {
+            "type": normalize_research_log_type(str(artifact.get("artifact_type") or "research_note")),
+            "title": str(artifact.get("title") or "").strip(),
+            "content": str(artifact.get("content") or artifact.get("summary") or "").strip(),
+            "session_id": str(session_id or ""),
+        }
+        if signature:
+            record["tool_signature"] = signature
+        created = self.research_log.append_records(project_slug, [record])
+        return created[0] if created else None
+
+    def _observe_verification_tool_result(
+        self,
+        project_slug: str,
+        *,
+        tool_name: str,
+        arguments: Dict[str, object],
+        output: Dict[str, object],
+    ) -> None:
+        """Record one verification tool result into the digest log and workflow state."""
+        state = self.load_state(project_slug)
+        passed = bool(output.get("passed"))
+        review_status = "passed" if passed else "failed"
+        claim = str(output.get("claim") or arguments.get("claim") or state.current_claim or "").strip()
+        summary = str(output.get("summary") or "").strip()
+        metadata = dict(arguments or {})
+        metadata.update(dict(output or {}))
+        metadata["tool"] = str(tool_name or "")
+        metadata["proof"] = str(arguments.get("proof") or output.get("proof") or "")
+        self._append_verification_digest(
+            project_slug,
+            claim=claim,
+            summary=summary or claim,
+            review_status=review_status,
+            status=str(output.get("status") or ""),
+            branch_id=state.active_branch_id,
+            metadata=metadata,
+        )
+        scope = str(output.get("scope") or arguments.get("scope") or "").strip().lower()
+        critical_errors = [str(item) for item in list(output.get("critical_errors") or [])]
+        if not passed:
+            state.verification = {
+                "verdict": "needs_correction",
+                "critical_errors": critical_errors,
+                "rationale": summary,
+            }
+            if claim:
+                state.pending_verification_items = _dedupe_strings(
+                    list(state.pending_verification_items or []) + [claim]
+                )
+            if claim:
+                self._register_claim(
+                    state,
+                    claim=claim,
+                    status="needs_correction",
+                    review_status="failed",
+                    branch_id=state.active_branch_id,
+                    summary=summary,
+                )
+        else:
+            if claim:
+                self._register_claim(
+                    state,
+                    claim=claim,
+                    status="verified",
+                    review_status="passed",
+                    branch_id=state.active_branch_id,
+                    summary=summary,
+                )
+            if scope == "final":
+                blueprint_path = str(output.get("blueprint_path") or arguments.get("blueprint_path") or "").strip()
+                state.verification = {
+                    "verdict": "verified",
+                    "critical_errors": [],
+                    "rationale": summary,
+                }
+                state.final_verification_gate = {
+                    "has_complete_answer": True,
+                    "ready_for_final_verification": True,
+                    "blueprint_path": blueprint_path,
+                    "reason": summary or "Final verification has passed.",
+                }
+                state.status = "completed"
+        self.save_state(state, mirror_progress=False, checkpoint_reason="verification_observed")
 
     def refresh_after_turn(
         self,
@@ -3143,6 +3485,23 @@ class ResearchWorkflowManager(object):
                 "blueprint_path": blueprint_relative,
                 "reason": str(state.final_verification_gate.get("reason") or "Final verification has passed."),
             }
+        if capture.get("blueprint_updated"):
+            gate = dict(state.final_verification_gate or _default_final_verification_gate())
+            verification = dict(state.verification or _default_verification())
+            if bool(gate.get("ready_for_final_verification")) or str(verification.get("verdict") or "") == "verified":
+                gate["ready_for_final_verification"] = False
+                gate["reason"] = (
+                    "The blueprint changed after the last verification; "
+                    "rerun final verification before relying on it."
+                )
+                state.final_verification_gate = gate
+                verification["verdict"] = "not_checked"
+                state.verification = verification
+                if str(state.status or "") == "completed":
+                    state.status = "active"
+                capture["verification_invalidated"] = True
+                workspace_reduction["blueprint_changed"] = True
+                workspace_reduction["verification_invalidated"] = True
         self._refresh_live_attempt_counters(state)
         self._refresh_live_state_assessment(state, session_id=session_id)
         checkpoint_meta = self.save_state(state, mirror_progress=False, checkpoint_reason="turn_refresh")
@@ -3264,6 +3623,7 @@ class ResearchWorkflowManager(object):
 
     def load_state(self, project_slug: str, seed: str = "") -> ResearchWorkflowState:
         """Load or initialize the workflow state for a project."""
+        self._ensure_workspace_scaffold(project_slug)
         try:
             payload = read_json(self._state_path(project_slug), default=None)
         except ValueError:

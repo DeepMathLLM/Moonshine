@@ -2,7 +2,7 @@
 {
   "name": "query_session_records",
   "handler": "query_session_records",
-  "description": "Search the current or selected session through the unified session-record index and return source-linked local context plus raw archive locations.",
+  "description": "Search the current or selected session through the unified session-record index and return source-linked local context plus raw records and archive locations.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

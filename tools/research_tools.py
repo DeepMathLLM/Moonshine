@@ -149,6 +149,26 @@ def assess_problem_quality(
         except Exception as exc:
             assessment = _failure_quality_assessment("Structured quality-assessor review failed or returned invalid output: %s" % exc)
 
+    workflow = runtime.get("research_workflow")
+    if workflow is not None:
+        from moonshine.utils import utc_now
+
+        state = workflow.load_state(resolved_project)
+        created_at = utc_now()
+        if set_as_active:
+            workflow._set_active_problem(state, statement=str(problem), created_at=created_at)
+        review_metadata = dict(assessment)
+        review_metadata["skill_slug"] = "quality-assessor"
+        workflow._update_problem_review(
+            state,
+            title="Quality review: %s" % shorten(str(problem), 80),
+            summary=str(assessment.get("rationale") or ""),
+            review_status=str(assessment.get("review_status") or "pending"),
+            metadata=review_metadata,
+            created_at=created_at,
+        )
+        workflow.save_state(state)
+
     return {
         "tool": "assess_problem_quality",
         "status": "completed",
@@ -179,16 +199,34 @@ def record_research_artifact(
     set_as_active: bool = False,
     metadata: Optional[Dict[str, object]] = None,
 ) -> dict:
-    """Deprecated explicit artifact writer.
-
-    Research mode memory is managed by the project research-memory pipeline.
-    """
-    return {
-        "tool": "record_research_artifact",
-        "status": "deprecated",
-        "archived": False,
-        "message": "Explicit artifact recording is disabled; project research memory uses research_log.jsonl.",
-    }
+    """Persist one typed research artifact through the shared workflow path."""
+    workflow = runtime.get("research_workflow")
+    if workflow is None:
+        return {
+            "tool": "record_research_artifact",
+            "status": "unavailable",
+            "archived": False,
+            "message": "Research workflow is not available in this runtime.",
+        }
+    result = workflow.record_artifact(
+        project_slug=str(runtime.get("project_slug") or "general"),
+        session_id=str(runtime.get("session_id") or ""),
+        artifact_type=artifact_type,
+        title=title,
+        summary=summary,
+        content=content,
+        stage=stage,
+        focus_activity=focus_activity,
+        status=status,
+        review_status=review_status,
+        related_ids=related_ids,
+        tags=tags,
+        next_action=next_action,
+        set_as_active=set_as_active,
+        metadata=metadata,
+    )
+    result["tool"] = "record_research_artifact"
+    return result
 
 
 def _record_fixed_artifact(
